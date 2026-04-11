@@ -1,0 +1,3505 @@
+import { useDeferredValue, useEffect, useRef, useState } from 'react'
+import type { CSSProperties, KeyboardEvent } from 'react'
+import { FitAddon } from '@xterm/addon-fit'
+import { Terminal as XTerm } from '@xterm/xterm'
+import {
+  ArrowLeft,
+  Check,
+  ChevronRight,
+  FileText,
+  Folder,
+  LayoutGrid,
+  ListTree,
+  Pencil,
+  Play,
+  Power,
+  RefreshCcw,
+  RotateCw,
+  Search,
+  Square,
+  Terminal,
+  Trash2,
+  X
+} from 'lucide-react'
+import type {
+  LaunchdAction,
+  LaunchdPlistDocument,
+  LaunchdService,
+  LaunchdTerminalMode,
+  ServiceLoadSnapshot,
+  ServiceAutomationSettings,
+  ServiceLogs,
+  StartConditionState,
+  TerminalExitEvent,
+  TerminalSessionInfo
+} from '@shared/types'
+
+type LogKind = 'stdout' | 'stderr'
+type CardFeedbackTone = 'neutral' | 'progress' | 'success' | 'error'
+type ServiceViewMode = 'grid' | 'tree'
+type RecoverableLaunchdAction = Extract<LaunchdAction, 'start' | 'restart'>
+
+interface CardFeedback {
+  tone: CardFeedbackTone
+  message: string
+}
+
+interface FailureHint {
+  title: string
+  detail: string
+}
+
+interface ServiceActionFailure {
+  action: RecoverableLaunchdAction
+  message: string
+  occurredAt: string
+  hints: FailureHint[]
+}
+
+interface ServiceLoadMetricDisplay {
+  label: string
+  value: string
+  title: string
+  unavailable?: boolean
+}
+
+interface LogPanelState {
+  mode: 'log'
+  title: string
+  subtitle: string
+  content: string
+  serviceLabel: string
+  kind: LogKind
+  generatedAt: string
+  failure: ServiceActionFailure | null
+}
+
+interface TerminalPanelState {
+  mode: 'terminal'
+  session: TerminalSessionInfo
+  serviceLabel: string
+  terminalMode: LaunchdTerminalMode
+}
+
+type ContentPanelState = { mode: 'services' } | LogPanelState | TerminalPanelState
+type ServiceTreeNode = ServiceTreeFolder | ServiceTreeLeaf
+
+interface ServiceTreeFolder {
+  type: 'folder'
+  name: string
+  path: string
+  children: ServiceTreeNode[]
+  serviceCount: number
+  runningCount: number
+}
+
+interface ServiceTreeLeaf {
+  type: 'service'
+  path: string
+  leafName: string
+  service: LaunchdService
+}
+
+interface LaunchdPlistSnippet {
+  key: string
+  title: string
+  description: string
+  snippet: string
+  insertText?: string
+}
+
+const servicesPanel: ContentPanelState = { mode: 'services' }
+const timePattern = /^([01]\d|2[0-3]):([0-5]\d)$/
+const launchdPlistLibrary: LaunchdPlistSnippet[] = [
+  {
+    key: 'label',
+    title: 'Label',
+    description: 'Unique reverse-DNS identifier for the job.',
+    snippet: '<key>Label</key>\n<string>com.example.agent</string>'
+  },
+  {
+    key: 'program',
+    title: 'Program',
+    description: 'Absolute executable path when you are not using an argument array.',
+    snippet: '<key>Program</key>\n<string>/usr/local/bin/example</string>'
+  },
+  {
+    key: 'programArguments',
+    title: 'ProgramArguments',
+    description: 'Preferred command definition for scripts and executables with arguments.',
+    snippet:
+      '<key>ProgramArguments</key>\n<array>\n  <string>/bin/zsh</string>\n  <string>/Users/you/bin/job.sh</string>\n</array>'
+  },
+  {
+    key: 'workingDirectory',
+    title: 'WorkingDirectory',
+    description: 'Sets the current directory before launchd starts the process.',
+    snippet: '<key>WorkingDirectory</key>\n<string>/Users/you/projects/app</string>'
+  },
+  {
+    key: 'environmentVariables',
+    title: 'EnvironmentVariables',
+    description: 'Adds environment variables for the launched process.',
+    snippet:
+      '<key>EnvironmentVariables</key>\n<dict>\n  <key>PATH</key>\n  <string>/opt/homebrew/bin:/usr/bin:/bin</string>\n  <key>NODE_ENV</key>\n  <string>production</string>\n</dict>'
+  },
+  {
+    key: 'runAtLoad',
+    title: 'RunAtLoad',
+    description: 'Starts the job immediately when the agent loads.',
+    snippet: '<key>RunAtLoad</key>\n<true />'
+  },
+  {
+    key: 'keepAlive',
+    title: 'KeepAlive',
+    description: 'Relaunches the job whenever it exits.',
+    snippet: '<key>KeepAlive</key>\n<true />'
+  },
+  {
+    key: 'keepAliveConditions',
+    title: 'KeepAlive Conditions',
+    description: 'Relaunches based on specific launchd conditions instead of every exit.',
+    snippet:
+      '<key>KeepAlive</key>\n<dict>\n  <key>SuccessfulExit</key>\n  <false />\n  <key>NetworkState</key>\n  <true />\n</dict>'
+  },
+  {
+    key: 'startInterval',
+    title: 'StartInterval',
+    description: 'Runs the job on a fixed second-based interval.',
+    snippet: '<key>StartInterval</key>\n<integer>300</integer>'
+  },
+  {
+    key: 'startCalendarInterval',
+    title: 'StartCalendarInterval',
+    description: 'Runs on a specific schedule using calendar fields.',
+    snippet:
+      '<key>StartCalendarInterval</key>\n<array>\n  <dict>\n    <key>Hour</key>\n    <integer>9</integer>\n    <key>Minute</key>\n    <integer>30</integer>\n  </dict>\n</array>'
+  },
+  {
+    key: 'watchPaths',
+    title: 'WatchPaths',
+    description: 'Triggers a launch when the listed paths change.',
+    snippet:
+      '<key>WatchPaths</key>\n<array>\n  <string>/Users/you/Library/Application Support/MyApp/config.json</string>\n</array>'
+  },
+  {
+    key: 'queueDirectories',
+    title: 'QueueDirectories',
+    description: 'Runs when files appear in the listed queue directories.',
+    snippet:
+      '<key>QueueDirectories</key>\n<array>\n  <string>/Users/you/queue</string>\n</array>'
+  },
+  {
+    key: 'startOnMount',
+    title: 'StartOnMount',
+    description: 'Starts the job when filesystems are mounted.',
+    snippet: '<key>StartOnMount</key>\n<true />'
+  },
+  {
+    key: 'standardOutPath',
+    title: 'StandardOutPath',
+    description: 'Redirects stdout to a file that is easy to tail.',
+    snippet: '<key>StandardOutPath</key>\n<string>/tmp/example-agent.out.log</string>'
+  },
+  {
+    key: 'standardErrorPath',
+    title: 'StandardErrorPath',
+    description: 'Redirects stderr to a file for crash and startup diagnostics.',
+    snippet: '<key>StandardErrorPath</key>\n<string>/tmp/example-agent.err.log</string>'
+  },
+  {
+    key: 'processType',
+    title: 'ProcessType',
+    description: 'Hints how aggressively the system should treat the job.',
+    snippet: '<key>ProcessType</key>\n<string>Background</string>'
+  },
+  {
+    key: 'throttleInterval',
+    title: 'ThrottleInterval',
+    description: 'Adds a cooldown between relaunch attempts.',
+    snippet: '<key>ThrottleInterval</key>\n<integer>10</integer>'
+  },
+  {
+    key: 'nice',
+    title: 'Nice',
+    description: 'Adjusts process priority for lower-importance work.',
+    snippet: '<key>Nice</key>\n<integer>1</integer>'
+  },
+  {
+    key: 'umask',
+    title: 'Umask',
+    description: 'Controls default file permissions for files the job creates.',
+    snippet: '<key>Umask</key>\n<integer>18</integer>'
+  },
+  {
+    key: 'userName',
+    title: 'UserName',
+    description: 'Runs the job as a specific user when launchd allows it.',
+    snippet: '<key>UserName</key>\n<string>your-user</string>'
+  },
+  {
+    key: 'groupName',
+    title: 'GroupName',
+    description: 'Runs the job with a specific group.',
+    snippet: '<key>GroupName</key>\n<string>staff</string>'
+  },
+  {
+    key: 'sessionCreate',
+    title: 'SessionCreate',
+    description: 'Creates a new login session for the launched process.',
+    snippet: '<key>SessionCreate</key>\n<true />'
+  },
+  {
+    key: 'limitLoadToSessionType',
+    title: 'LimitLoadToSessionType',
+    description: 'Restricts the job to a launchd session class.',
+    snippet:
+      '<key>LimitLoadToSessionType</key>\n<array>\n  <string>Aqua</string>\n</array>'
+  },
+  {
+    key: 'enableTransactions',
+    title: 'EnableTransactions',
+    description: 'Lets the process participate in launchd transactions.',
+    snippet: '<key>EnableTransactions</key>\n<true />'
+  },
+  {
+    key: 'enablePressuredExit',
+    title: 'EnablePressuredExit',
+    description: 'Allows launchd to request exit under memory pressure.',
+    snippet: '<key>EnablePressuredExit</key>\n<true />'
+  },
+  {
+    key: 'abandonProcessGroup',
+    title: 'AbandonProcessGroup',
+    description: 'Prevents launchd from terminating the entire child process group on exit.',
+    snippet: '<key>AbandonProcessGroup</key>\n<true />'
+  },
+  {
+    key: 'exitTimeOut',
+    title: 'ExitTimeOut',
+    description: 'How long launchd waits for clean shutdown before escalation.',
+    snippet: '<key>ExitTimeOut</key>\n<integer>20</integer>'
+  },
+  {
+    key: 'timeOut',
+    title: 'TimeOut',
+    description: 'How long launchd waits for a check-in or socket-based service.',
+    snippet: '<key>TimeOut</key>\n<integer>30</integer>'
+  },
+  {
+    key: 'initGroups',
+    title: 'InitGroups',
+    description: 'Initializes supplementary groups for the launched process.',
+    snippet: '<key>InitGroups</key>\n<true />'
+  },
+  {
+    key: 'rootDirectory',
+    title: 'RootDirectory',
+    description: 'Changes the process root before execution.',
+    snippet: '<key>RootDirectory</key>\n<string>/private/var/empty</string>'
+  },
+  {
+    key: 'softResourceLimits',
+    title: 'SoftResourceLimits',
+    description: 'Applies soft resource caps such as max open files.',
+    snippet:
+      '<key>SoftResourceLimits</key>\n<dict>\n  <key>NumberOfFiles</key>\n  <integer>1024</integer>\n</dict>'
+  },
+  {
+    key: 'hardResourceLimits',
+    title: 'HardResourceLimits',
+    description: 'Applies hard resource caps that the process cannot exceed.',
+    snippet:
+      '<key>HardResourceLimits</key>\n<dict>\n  <key>NumberOfFiles</key>\n  <integer>4096</integer>\n</dict>'
+  },
+  {
+    key: 'machServices',
+    title: 'MachServices',
+    description: 'Registers Mach service names provided by the job.',
+    snippet:
+      '<key>MachServices</key>\n<dict>\n  <key>com.example.agent</key>\n  <true />\n</dict>'
+  },
+  {
+    key: 'sockets',
+    title: 'Sockets',
+    description: 'Defines sockets that launchd creates and passes to the job.',
+    snippet:
+      '<key>Sockets</key>\n<dict>\n  <key>Listeners</key>\n  <dict>\n    <key>SockServiceName</key>\n    <string>8080</string>\n  </dict>\n</dict>'
+  }
+]
+const launchdCommandLibrary: LaunchdPlistSnippet[] = [
+  {
+    key: 'launchctlPrint',
+    title: 'Print job state',
+    description: 'Inspect the loaded job state and recent launchd details.',
+    snippet: 'launchctl print gui/$(id -u)/com.example.agent',
+    insertText: '<!-- launchd: launchctl print gui/$(id -u)/com.example.agent -->'
+  },
+  {
+    key: 'launchctlBootstrap',
+    title: 'Load plist',
+    description: 'Load a LaunchAgent plist into the current GUI session.',
+    snippet: 'launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.agent.plist',
+    insertText:
+      '<!-- launchd: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.agent.plist -->'
+  },
+  {
+    key: 'launchctlBootout',
+    title: 'Unload plist',
+    description: 'Unload a LaunchAgent plist from the current GUI session.',
+    snippet: 'launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.example.agent.plist',
+    insertText:
+      '<!-- launchd: launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.example.agent.plist -->'
+  },
+  {
+    key: 'launchctlKickstart',
+    title: 'Kickstart job',
+    description: 'Start a loaded job immediately through launchd.',
+    snippet: 'launchctl kickstart -k gui/$(id -u)/com.example.agent',
+    insertText: '<!-- launchd: launchctl kickstart -k gui/$(id -u)/com.example.agent -->'
+  },
+  {
+    key: 'launchctlEnable',
+    title: 'Enable job',
+    description: 'Allow launchd to run this label in the GUI session.',
+    snippet: 'launchctl enable gui/$(id -u)/com.example.agent',
+    insertText: '<!-- launchd: launchctl enable gui/$(id -u)/com.example.agent -->'
+  },
+  {
+    key: 'launchctlDisable',
+    title: 'Disable job',
+    description: 'Prevent launchd from running this label in the GUI session.',
+    snippet: 'launchctl disable gui/$(id -u)/com.example.agent',
+    insertText: '<!-- launchd: launchctl disable gui/$(id -u)/com.example.agent -->'
+  }
+]
+
+async function copyTextToClipboard(value: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value)
+    return
+  }
+
+  const helper = window.document.createElement('textarea')
+  helper.value = value
+  helper.setAttribute('readonly', 'true')
+  helper.style.position = 'fixed'
+  helper.style.opacity = '0'
+  window.document.body.append(helper)
+  helper.select()
+  window.document.execCommand('copy')
+  helper.remove()
+}
+
+function sortServices(services: LaunchdService[]): LaunchdService[] {
+  return [...services].sort((left, right) => {
+    if (left.running !== right.running) {
+      return left.running ? -1 : 1
+    }
+
+    return left.name.localeCompare(right.name)
+  })
+}
+
+function countBy(services: LaunchdService[], predicate: (service: LaunchdService) => boolean): number {
+  return services.filter(predicate).length
+}
+
+function getSelectedLabel(
+  services: LaunchdService[],
+  currentLabel: string | null
+): string | null {
+  if (currentLabel && services.some((service) => service.label === currentLabel)) {
+    return currentLabel
+  }
+
+  return services[0]?.label ?? null
+}
+
+function getActionLabel(action: LaunchdAction): string {
+  switch (action) {
+    case 'start':
+      return 'Start'
+    case 'stop':
+      return 'Stop'
+    case 'restart':
+      return 'Restart'
+    case 'enable':
+      return 'Enable'
+    case 'disable':
+      return 'Disable'
+    case 'delete':
+      return 'Delete'
+    default: {
+      const exhaustiveAction: never = action
+      return exhaustiveAction
+    }
+  }
+}
+
+function getActionProgress(action: LaunchdAction): string {
+  switch (action) {
+    case 'start':
+      return 'Starting'
+    case 'stop':
+      return 'Stopping'
+    case 'restart':
+      return 'Restarting'
+    case 'enable':
+      return 'Enabling'
+    case 'disable':
+      return 'Disabling'
+    case 'delete':
+      return 'Deleting'
+    default: {
+      const exhaustiveAction: never = action
+      return exhaustiveAction
+    }
+  }
+}
+
+function getActionDone(action: LaunchdAction): string {
+  switch (action) {
+    case 'start':
+      return 'Started'
+    case 'stop':
+      return 'Stopped'
+    case 'restart':
+      return 'Restarted'
+    case 'enable':
+      return 'Enabled'
+    case 'disable':
+      return 'Disabled'
+    case 'delete':
+      return 'Deleted'
+    default: {
+      const exhaustiveAction: never = action
+      return exhaustiveAction
+    }
+  }
+}
+
+function getLogButtonLabel(kind: LogKind): string {
+  return kind === 'stderr' ? 'err' : 'output'
+}
+
+function getLogHeading(kind: LogKind): string {
+  return kind === 'stderr' ? 'stderr log' : 'stdout log'
+}
+
+function hasLogTarget(service: LaunchdService | null, kind: LogKind): boolean {
+  return service?.logTargets.some((target) => target.kind === kind) ?? false
+}
+
+function getAlternateLogKind(service: LaunchdService | null, currentKind: LogKind): LogKind | null {
+  if (!service) {
+    return null
+  }
+
+  const alternateKind: LogKind = currentKind === 'stderr' ? 'stdout' : 'stderr'
+  return hasLogTarget(service, alternateKind) ? alternateKind : null
+}
+
+function formatClock(date = new Date()): string {
+  return date.toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  })
+}
+
+function formatGeneratedAt(value: string): string {
+  const date = new Date(value)
+
+  if (Number.isNaN(date.getTime())) {
+    return value
+  }
+
+  return formatClock(date)
+}
+
+function getServiceStateSummary(service: LaunchdService): string {
+  if (service.running && service.pid) {
+    return `Running with PID ${service.pid}.`
+  }
+
+  if (service.loaded && service.lastExitStatus !== null) {
+    return `Loaded in launchd. Last exit ${service.lastExitStatus}.`
+  }
+
+  if (service.loaded) {
+    return 'Loaded in launchd.'
+  }
+
+  if (!service.enabled) {
+    return 'Disabled in launchd.'
+  }
+
+  if (service.lastExitStatus !== null) {
+    return `Stopped. Last exit ${service.lastExitStatus}.`
+  }
+
+  return 'Stopped.'
+}
+
+function getDefaultCardFeedback(service: LaunchdService): CardFeedback {
+  return {
+    tone: 'neutral',
+    message: service.serviceInfo ?? getServiceStateSummary(service)
+  }
+}
+
+function getFeedbackBadgeLabel(tone: CardFeedbackTone): string {
+  switch (tone) {
+    case 'progress':
+      return 'Working'
+    case 'success':
+      return 'Updated'
+    case 'error':
+      return 'Issue'
+    case 'neutral':
+    default:
+      return 'State'
+  }
+}
+
+function getServiceName(label: string, services: LaunchdService[]): string {
+  return services.find((service) => service.label === label)?.name ?? label
+}
+
+function compareTimes(left: string, right: string): number {
+  return left.localeCompare(right)
+}
+
+function parseAutomaticStartTimes(value: string): {
+  times: string[]
+  invalidEntries: string[]
+} {
+  const entries = value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+  const uniqueTimes = new Set<string>()
+  const invalidEntries: string[] = []
+
+  for (const entry of entries) {
+    if (!timePattern.test(entry)) {
+      invalidEntries.push(entry)
+      continue
+    }
+
+    uniqueTimes.add(entry)
+  }
+
+  return {
+    times: [...uniqueTimes].sort(compareTimes),
+    invalidEntries
+  }
+}
+
+function summarizeAutomation(service: LaunchdService, services: LaunchdService[]): string {
+  const parts: string[] = []
+  const startCondition = service.automation.startCondition
+
+  if (service.automation.startOnLaunch) {
+    const delaySuffix =
+      service.automation.launchDelaySeconds > 0
+        ? ` after ${service.automation.launchDelaySeconds}s`
+        : ''
+
+    parts.push(`Starts when LaunchControl opens${delaySuffix}.`)
+  }
+
+  if (startCondition) {
+    const waitLabel = startCondition.waitFor === 'loaded' ? 'loads' : 'starts running'
+    const delaySuffix =
+      startCondition.delaySeconds > 0 ? ` + ${startCondition.delaySeconds}s` : ''
+
+    parts.push(
+      `Starts after ${getServiceName(startCondition.afterLabel, services)} ${waitLabel}${delaySuffix}.`
+    )
+  }
+
+  if (service.automation.automaticStartTimes.length > 0) {
+    parts.push(`Daily auto-start at ${service.automation.automaticStartTimes.join(', ')}.`)
+  }
+
+  if (service.automation.ensureRunning) {
+    parts.push('Keeps this service running while LaunchControl is open.')
+  }
+
+  return parts.join(' ') || 'No automation rules.'
+}
+
+function getServiceSignals(service: LaunchdService, services: LaunchdService[] = []): string[] {
+  const signals = [service.enabled ? 'Enabled' : 'Disabled']
+
+  if (service.running && service.pid) {
+    signals.unshift(`PID ${service.pid}`)
+  }
+
+  if (service.automation.startCondition) {
+    signals.push(`After ${getServiceName(service.automation.startCondition.afterLabel, services)}`)
+  }
+
+  if (service.automation.startOnLaunch) {
+    signals.push(
+      service.automation.launchDelaySeconds > 0
+        ? `Launch +${service.automation.launchDelaySeconds}s`
+        : 'On launch'
+    )
+  }
+
+  if (service.automation.automaticStartTimes.length > 0) {
+    signals.push(
+      service.automation.automaticStartTimes.length === 1
+        ? `Auto ${service.automation.automaticStartTimes[0]}`
+        : `${service.automation.automaticStartTimes.length} auto times`
+    )
+  }
+
+  if (service.automation.ensureRunning) {
+    signals.push('Always on')
+  }
+
+  return signals
+}
+
+function formatPercentage(value: number | null): string {
+  if (value === null) {
+    return 'n/a'
+  }
+
+  const digits = value >= 10 ? 0 : 1
+  return `${value.toFixed(digits)}%`
+}
+
+function formatEnergyImpact(value: number | null): string {
+  if (value === null) {
+    return 'n/a'
+  }
+
+  const digits = value >= 10 ? 0 : 1
+  return value.toFixed(digits)
+}
+
+function formatBytes(value: number | null): string {
+  if (value === null) {
+    return 'n/a'
+  }
+
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let size = value
+  let unitIndex = 0
+
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024
+    unitIndex += 1
+  }
+
+  const digits = size >= 100 || unitIndex === 0 ? 0 : size >= 10 ? 1 : 2
+  return `${size.toFixed(digits)} ${units[unitIndex]}`
+}
+
+function getServiceLoadMetrics(load: ServiceLoadSnapshot): ServiceLoadMetricDisplay[] {
+  const unavailableReason =
+    'Per-process GPU and VRAM metrics are unavailable without privileged macOS sampling.'
+
+  return [
+    {
+      label: 'CPU',
+      value: formatPercentage(load.cpuPercent),
+      title: 'Current process CPU usage.'
+    },
+    {
+      label: 'GPU',
+      value: formatPercentage(load.gpuPercent),
+      title: unavailableReason,
+      unavailable: load.gpuPercent === null
+    },
+    {
+      label: 'RAM',
+      value: formatBytes(load.residentMemoryBytes),
+      title: 'Resident memory currently used by the process.'
+    },
+    {
+      label: 'VRAM',
+      value: formatBytes(load.vramBytes),
+      title: unavailableReason,
+      unavailable: load.vramBytes === null
+    },
+    {
+      label: 'MEM',
+      value: formatPercentage(load.memoryPercent),
+      title: 'Share of total system memory currently used by the process.'
+    },
+    {
+      label: 'ENERGY',
+      value: formatEnergyImpact(load.energyImpact),
+      title: 'macOS energy impact reported by top.'
+    }
+  ]
+}
+
+function getAdaptiveTitleSize(name: string): string {
+  if (name.length > 54) {
+    return '1rem'
+  }
+
+  if (name.length > 42) {
+    return '1.15rem'
+  }
+
+  if (name.length > 30) {
+    return '1.35rem'
+  }
+
+  if (name.length > 22) {
+    return '1.65rem'
+  }
+
+  return '2rem'
+}
+
+function matchesServiceQuery(service: LaunchdService, query: string): boolean {
+  const normalizedQuery = query.trim().toLowerCase()
+
+  if (!normalizedQuery) {
+    return true
+  }
+
+  return [
+    service.name,
+    service.alias ?? '',
+    service.label,
+    service.plistName ?? '',
+    service.serviceInfo ?? '',
+    service.status,
+    service.enabled ? 'enabled' : 'disabled',
+    service.running ? 'running' : 'stopped'
+  ]
+    .join('\n')
+    .toLowerCase()
+    .includes(normalizedQuery)
+}
+
+function findLogFile(logs: ServiceLogs, kind: LogKind) {
+  return logs.files.find((candidate) => candidate.kind === kind) ?? null
+}
+
+function buildLogPanel(
+  logs: ServiceLogs,
+  kind: LogKind,
+  failure: ServiceActionFailure | null = null
+): LogPanelState {
+  const file = findLogFile(logs, kind)
+
+  if (!file) {
+    return {
+      mode: 'log',
+      title: logs.name,
+      subtitle: `No ${getLogButtonLabel(kind)} path declared`,
+      content: `This service does not declare a ${getLogHeading(kind)} path in its plist.`,
+      serviceLabel: logs.label,
+      kind,
+      generatedAt: logs.generatedAt,
+      failure
+    }
+  }
+
+  return {
+    mode: 'log',
+    title: logs.name,
+    subtitle: file.path,
+    content: file.exists ? file.content || '(empty file)' : 'File not found.',
+    serviceLabel: logs.label,
+    kind,
+    generatedAt: logs.generatedAt,
+    failure
+  }
+}
+
+function getTerminalHeading(mode: LaunchdTerminalMode): string {
+  return mode === 'logs' ? 'Live logs terminal' : 'Interactive terminal'
+}
+
+function getTerminalSummary(mode: LaunchdTerminalMode): string {
+  return mode === 'logs'
+    ? 'PTY session running the log tail command inside the app.'
+    : 'PTY session attached to an interactive shell inside the app.'
+}
+
+function pruneCardFeedbacks(
+  feedbacks: Record<string, CardFeedback>,
+  services: LaunchdService[]
+): Record<string, CardFeedback> {
+  const activeLabels = new Set(services.map((service) => service.label))
+
+  return Object.fromEntries(
+    Object.entries(feedbacks).filter(([label]) => activeLabels.has(label))
+  )
+}
+
+function pruneActionFailures(
+  failures: Record<string, ServiceActionFailure>,
+  services: LaunchdService[]
+): Record<string, ServiceActionFailure> {
+  const activeLabels = new Set(services.map((service) => service.label))
+
+  return Object.fromEntries(
+    Object.entries(failures).filter(([label]) => activeLabels.has(label))
+  )
+}
+
+function addFailureHint(
+  hints: FailureHint[],
+  title: string,
+  detail: string
+): void {
+  if (hints.some((hint) => hint.title === title)) {
+    return
+  }
+
+  hints.push({ title, detail })
+}
+
+function buildActionFailure(service: LaunchdService, action: RecoverableLaunchdAction, message: string): ServiceActionFailure {
+  const hints: FailureHint[] = []
+
+  if (hasLogTarget(service, 'stderr')) {
+    addFailureHint(
+      hints,
+      'Check stderr first',
+      'The stderr tail usually contains the immediate launchd or process-level failure details.'
+    )
+  } else {
+    addFailureHint(
+      hints,
+      'Add an err log',
+      'Set StandardErrorPath in the plist so failed starts leave a readable traceback or shell error.'
+    )
+  }
+
+  if (hasLogTarget(service, 'stdout')) {
+    addFailureHint(
+      hints,
+      'Compare stdout too',
+      'stdout often shows the last successful step before the process exited or hung during startup.'
+    )
+  } else {
+    addFailureHint(
+      hints,
+      'Add an output log',
+      'Set StandardOutPath in the plist so normal startup output is captured beside stderr.'
+    )
+  }
+
+  if (/No such file|not found|posix_spawn/i.test(message)) {
+    addFailureHint(
+      hints,
+      'Verify executable paths',
+      'Check Program or ProgramArguments in the plist. A script, binary, or working directory path is likely missing.'
+    )
+  }
+
+  if (/Permission denied|Operation not permitted|not permitted/i.test(message)) {
+    addFailureHint(
+      hints,
+      'Check permissions',
+      'Make sure the target script is executable and any files or folders it touches are readable in the user session.'
+    )
+  }
+
+  if (/bootstrap|Input\/output error|I\/O error|invalid/i.test(message)) {
+    addFailureHint(
+      hints,
+      'Validate the plist',
+      'Review the plist for malformed XML, unsupported keys, or a bad Label/ProgramArguments configuration before retrying.'
+    )
+  }
+
+  if (service.lastExitStatus !== null) {
+    addFailureHint(
+      hints,
+      'Last exit status',
+      `The previous run ended with exit status ${service.lastExitStatus}. Match that with the current log tail to find the first failing step.`
+    )
+  }
+
+  addFailureHint(
+    hints,
+    'Retry in a terminal',
+    'Open the terminal view and run the underlying command directly to catch missing environment variables, path issues, or interactive prompts.'
+  )
+
+  return {
+    action,
+    message,
+    occurredAt: new Date().toISOString(),
+    hints: hints.slice(0, 4)
+  }
+}
+
+function getPreferredFailureLogKind(service: LaunchdService, logs: ServiceLogs): LogKind {
+  if (findLogFile(logs, 'stderr') || hasLogTarget(service, 'stderr')) {
+    return 'stderr'
+  }
+
+  return 'stdout'
+}
+
+function normalizeServiceNameInput(value: string): string {
+  return value
+    .split('/')
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+    .join('/')
+}
+
+function getServiceLeafName(service: LaunchdService): string {
+  const segments = getServiceTreeSegments(service)
+  return segments[segments.length - 1] ?? service.name
+}
+
+function resolveServiceAliasInput(service: LaunchdService, value: string): string {
+  const normalizedValue = normalizeServiceNameInput(value)
+
+  if (!normalizedValue) {
+    return ''
+  }
+
+  if (/\/\s*$/.test(value.trim())) {
+    return `${normalizedValue}/${getServiceLeafName(service)}`
+  }
+
+  return normalizedValue
+}
+
+function getServiceTreeSegments(service: LaunchdService): string[] {
+  const aliasPath = normalizeServiceNameInput(service.alias ?? '')
+
+  if (aliasPath) {
+    return aliasPath.split('/')
+  }
+
+  return [service.name]
+}
+
+function getServiceFolderPath(service: LaunchdService): string {
+  return getServiceTreeSegments(service).slice(0, -1).join('/')
+}
+
+function handleTreeRowKeyDown(
+  event: KeyboardEvent<HTMLElement>,
+  callback: () => void
+): void {
+  if (event.key !== 'Enter' && event.key !== ' ') {
+    return
+  }
+
+  event.preventDefault()
+  callback()
+}
+
+function buildServiceTree(services: LaunchdService[]): ServiceTreeNode[] {
+  interface MutableFolder {
+    name: string
+    path: string
+    folders: Map<string, MutableFolder>
+    services: ServiceTreeLeaf[]
+  }
+
+  function createFolder(name: string, path: string): MutableFolder {
+    return {
+      name,
+      path,
+      folders: new Map(),
+      services: []
+    }
+  }
+
+  function finalizeFolder(folder: MutableFolder): ServiceTreeFolder {
+    const childFolders = [...folder.folders.values()]
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map(finalizeFolder)
+    const serviceCount =
+      folder.services.length +
+      childFolders.reduce((total, childFolder) => total + childFolder.serviceCount, 0)
+    const runningCount =
+      folder.services.filter((leaf) => leaf.service.running).length +
+      childFolders.reduce((total, childFolder) => total + childFolder.runningCount, 0)
+
+    return {
+      type: 'folder',
+      name: folder.name,
+      path: folder.path,
+      children: [...childFolders, ...folder.services],
+      serviceCount,
+      runningCount
+    }
+  }
+
+  const root = createFolder('', '')
+
+  for (const service of services) {
+    const segments = getServiceTreeSegments(service)
+    const folderSegments = segments.slice(0, -1)
+    const leafName = segments[segments.length - 1] ?? service.name
+    let currentFolder = root
+    let currentPath = ''
+
+    for (const segment of folderSegments) {
+      currentPath = currentPath ? `${currentPath}/${segment}` : segment
+      const existingFolder = currentFolder.folders.get(segment)
+
+      if (existingFolder) {
+        currentFolder = existingFolder
+        continue
+      }
+
+      const nextFolder = createFolder(segment, currentPath)
+      currentFolder.folders.set(segment, nextFolder)
+      currentFolder = nextFolder
+    }
+
+    currentFolder.services.push({
+      type: 'service',
+      path: service.label,
+      leafName,
+      service
+    })
+  }
+
+  const folders = [...root.folders.values()]
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .map(finalizeFolder)
+
+  return [...folders, ...root.services]
+}
+
+function collectExpandedFolderPaths(nodes: ServiceTreeNode[]): string[] {
+  const folderPaths: string[] = []
+
+  for (const node of nodes) {
+    if (node.type !== 'folder') {
+      continue
+    }
+
+    folderPaths.push(node.path, ...collectExpandedFolderPaths(node.children))
+  }
+
+  return folderPaths
+}
+
+export default function App(): JSX.Element {
+  const [services, setServices] = useState<LaunchdService[]>([])
+  const [selectedLabel, setSelectedLabel] = useState<string | null>(null)
+  const [selectedTreeLabels, setSelectedTreeLabels] = useState<string[]>([])
+  const [treeSelectionBusy, setTreeSelectionBusy] = useState(false)
+  const [contentPanel, setContentPanel] = useState<ContentPanelState>(servicesPanel)
+  const [cardFeedbacks, setCardFeedbacks] = useState<Record<string, CardFeedback>>({})
+  const [actionFailures, setActionFailures] = useState<Record<string, ServiceActionFailure>>({})
+  const [loading, setLoading] = useState(true)
+  const [busyLabel, setBusyLabel] = useState<string | null>(null)
+  const [pageError, setPageError] = useState<string | null>(null)
+  const [openAtLogin, setOpenAtLogin] = useState(false)
+  const [loginItemBusy, setLoginItemBusy] = useState(false)
+  const [expandedFolders, setExpandedFolders] = useState<Record<string, boolean>>({})
+  const [serviceViewMode, setServiceViewMode] = useState<ServiceViewMode>('grid')
+  const [searchQuery, setSearchQuery] = useState('')
+  const [treeFolderDraft, setTreeFolderDraft] = useState('')
+  const [treeFolderMessage, setTreeFolderMessage] = useState<string | null>(null)
+  const treeFolderInputRef = useRef<HTMLInputElement | null>(null)
+  const deferredSearchQuery = useDeferredValue(searchQuery)
+  const filteredServices = services.filter((service) =>
+    matchesServiceQuery(service, deferredSearchQuery)
+  )
+
+  const selectedService =
+    filteredServices.find((service) => service.label === selectedLabel) ?? filteredServices[0] ?? null
+  const logService =
+    contentPanel.mode === 'log'
+      ? services.find((service) => service.label === contentPanel.serviceLabel) ?? null
+      : null
+  const terminalService =
+    contentPanel.mode === 'log' || contentPanel.mode === 'terminal'
+      ? services.find((service) => service.label === contentPanel.serviceLabel) ?? null
+      : selectedService
+  const terminalMode: LaunchdTerminalMode =
+    contentPanel.mode === 'log'
+      ? 'logs'
+      : contentPanel.mode === 'terminal'
+        ? contentPanel.terminalMode
+        : 'service'
+  const alternateLogKind =
+    contentPanel.mode === 'log' ? getAlternateLogKind(logService, contentPanel.kind) : null
+  const serviceTree = buildServiceTree(filteredServices)
+  const servicesByLabel = Object.fromEntries(services.map((service) => [service.label, service]))
+  const searchActive = deferredSearchQuery.trim().length > 0
+
+  const summary = {
+    running: countBy(services, (service) => service.running),
+    enabled: countBy(services, (service) => service.enabled)
+  }
+
+  function setCardFeedback(label: string, feedback: CardFeedback): void {
+    setCardFeedbacks((current) => ({ ...current, [label]: feedback }))
+  }
+
+  function focusService(label: string): void {
+    setSelectedLabel(label)
+  }
+
+  async function loadServices(): Promise<void> {
+    setLoading(true)
+    setPageError(null)
+
+    try {
+      const nextServices = sortServices(await window.launchdControl.listServices())
+      setServices(nextServices)
+      setCardFeedbacks((current) => pruneCardFeedbacks(current, nextServices))
+      setActionFailures((current) => pruneActionFailures(current, nextServices))
+      setSelectedLabel((currentLabel) => getSelectedLabel(nextServices, currentLabel))
+      setContentPanel((current) => {
+        if (nextServices.length === 0) {
+          return servicesPanel
+        }
+
+        if (current.mode === 'log' || current.mode === 'terminal') {
+          return nextServices.some((service) => service.label === current.serviceLabel)
+            ? current
+            : servicesPanel
+        }
+
+        return current
+      })
+    } catch (loadError) {
+      setPageError(loadError instanceof Error ? loadError.message : String(loadError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function loadLoginItemSettings(): Promise<void> {
+    try {
+      const settings = await window.launchdControl.getLoginItemSettings()
+      setOpenAtLogin(settings.openAtLogin)
+    } catch (settingsError) {
+      setPageError(settingsError instanceof Error ? settingsError.message : String(settingsError))
+    }
+  }
+
+  useEffect(() => {
+    void Promise.all([loadServices(), loadLoginItemSettings()])
+  }, [])
+
+  useEffect(() => {
+    const folderPaths = collectExpandedFolderPaths(buildServiceTree(filteredServices))
+
+    setExpandedFolders((current) => {
+      const nextFolders: Record<string, boolean> = {}
+
+      for (const path of folderPaths) {
+        nextFolders[path] = current[path] ?? true
+      }
+
+      return nextFolders
+    })
+  }, [deferredSearchQuery, services])
+
+  useEffect(() => {
+    const visibleLabels = new Set(filteredServices.map((service) => service.label))
+
+    setSelectedTreeLabels((current) => {
+      const nextSelection = current.filter((label) => visibleLabels.has(label))
+      return nextSelection.length === current.length ? current : nextSelection
+    })
+  }, [deferredSearchQuery, services])
+
+  useEffect(() => {
+    if (serviceViewMode === 'tree') {
+      return
+    }
+
+    setSelectedTreeLabels((current) => (current.length === 0 ? current : []))
+  }, [serviceViewMode])
+
+  useEffect(() => {
+    if (contentPanel.mode !== 'services') {
+      return
+    }
+
+    setSelectedLabel((currentLabel) => getSelectedLabel(filteredServices, currentLabel))
+  }, [contentPanel.mode, deferredSearchQuery, services])
+
+  useEffect(() => {
+    if (contentPanel.mode !== 'terminal') {
+      return
+    }
+
+    return () => {
+      void closeEmbeddedTerminal(contentPanel.session.id)
+    }
+  }, [contentPanel])
+
+  useEffect(() => {
+    if (contentPanel.mode !== 'services' || serviceViewMode !== 'tree') {
+      return
+    }
+
+    function handleSlashShortcut(event: globalThis.KeyboardEvent): void {
+      if (event.key !== '/') {
+        return
+      }
+
+      const target = event.target instanceof Element ? event.target : null
+
+      if (target?.closest('input, textarea, select, [contenteditable="true"]')) {
+        return
+      }
+
+      event.preventDefault()
+      setTreeFolderMessage(null)
+      treeFolderInputRef.current?.focus()
+    }
+
+    window.addEventListener('keydown', handleSlashShortcut)
+
+    return () => window.removeEventListener('keydown', handleSlashShortcut)
+  }, [contentPanel.mode, serviceViewMode])
+
+  function toggleFolder(path: string): void {
+    setExpandedFolders((current) => ({
+      ...current,
+      [path]: !(current[path] ?? true)
+    }))
+  }
+
+  function toggleTreeSelection(label: string): void {
+    focusService(label)
+    setSelectedTreeLabels((current) =>
+      current.includes(label) ? current.filter((entry) => entry !== label) : [...current, label]
+    )
+  }
+
+  function clearTreeSelection(): void {
+    setSelectedTreeLabels([])
+  }
+
+  async function moveTreeSelectionToFolder(folderPath: string): Promise<void> {
+    if (treeSelectionBusy) {
+      return
+    }
+
+    const labelsToMove = selectedTreeLabels.filter((label) => {
+      const service = servicesByLabel[label]
+      return service ? getServiceFolderPath(service) !== folderPath : false
+    })
+
+    if (labelsToMove.length === 0) {
+      toggleFolder(folderPath)
+      return
+    }
+
+    const feedbackMessage =
+      labelsToMove.length === 1 ? `Moving into ${folderPath}...` : `Moving ${labelsToMove.length} services...`
+
+    setPageError(null)
+    setTreeSelectionBusy(true)
+    setCardFeedbacks((current) => ({
+      ...current,
+      ...Object.fromEntries(
+        labelsToMove.map((label) => [
+          label,
+          {
+            tone: 'progress' as const,
+            message: feedbackMessage
+          }
+        ])
+      )
+    }))
+
+    try {
+      const nextServices = sortServices(
+        await window.launchdControl.moveServicesToFolder(labelsToMove, folderPath)
+      )
+
+      setServices(nextServices)
+      setCardFeedbacks((current) =>
+        pruneCardFeedbacks(
+          {
+            ...current,
+            ...Object.fromEntries(
+              labelsToMove.map((label) => [
+                label,
+                {
+                  tone: 'success' as const,
+                  message: `Moved into ${folderPath}.`
+                }
+              ])
+            )
+          },
+          nextServices
+        )
+      )
+      setSelectedLabel((currentLabel) =>
+        getSelectedLabel(nextServices, currentLabel ?? labelsToMove[0] ?? null)
+      )
+      setSelectedTreeLabels([])
+    } catch (moveError) {
+      const message = moveError instanceof Error ? moveError.message : String(moveError)
+
+      setPageError(`Move failed: ${message}`)
+      setCardFeedbacks((current) => ({
+        ...current,
+        ...Object.fromEntries(
+          labelsToMove.map((label) => [
+            label,
+            {
+              tone: 'error' as const,
+              message: `Move failed: ${message}`
+            }
+          ])
+        )
+      }))
+    } finally {
+      setTreeSelectionBusy(false)
+    }
+  }
+
+  async function createTreeFolderFromSelection(): Promise<void> {
+    if (treeSelectionBusy) {
+      return
+    }
+
+    const folderPath = normalizeServiceNameInput(treeFolderDraft)
+
+    if (!folderPath) {
+      setTreeFolderMessage('Type a folder path first, for example homebrew/db.')
+      treeFolderInputRef.current?.focus()
+      return
+    }
+
+    const labelsToMove = (selectedTreeLabels.length > 0
+      ? selectedTreeLabels
+      : selectedService
+        ? [selectedService.label]
+        : []
+    ).filter((label) => {
+      const service = servicesByLabel[label]
+      return service ? getServiceFolderPath(service) !== folderPath : false
+    })
+
+    if (labelsToMove.length === 0) {
+      setTreeFolderMessage('Pick a service that is not already in that folder.')
+      treeFolderInputRef.current?.focus()
+      return
+    }
+
+    const feedbackMessage =
+      labelsToMove.length === 1
+        ? `Creating ${folderPath}...`
+        : `Creating ${folderPath} for ${labelsToMove.length} services...`
+
+    setPageError(null)
+    setTreeFolderMessage(null)
+    setTreeSelectionBusy(true)
+    setCardFeedbacks((current) => ({
+      ...current,
+      ...Object.fromEntries(
+        labelsToMove.map((label) => [
+          label,
+          {
+            tone: 'progress' as const,
+            message: feedbackMessage
+          }
+        ])
+      )
+    }))
+
+    try {
+      const nextServices = sortServices(
+        await window.launchdControl.moveServicesToFolder(labelsToMove, folderPath)
+      )
+
+      setServices(nextServices)
+      setCardFeedbacks((current) =>
+        pruneCardFeedbacks(
+          {
+            ...current,
+            ...Object.fromEntries(
+              labelsToMove.map((label) => [
+                label,
+                {
+                  tone: 'success' as const,
+                  message: `Moved into ${folderPath}.`
+                }
+              ])
+            )
+          },
+          nextServices
+        )
+      )
+      setExpandedFolders((current) => {
+        const nextFolders = { ...current }
+        let currentPath = ''
+
+        for (const segment of folderPath.split('/')) {
+          currentPath = currentPath ? `${currentPath}/${segment}` : segment
+          nextFolders[currentPath] = true
+        }
+
+        return nextFolders
+      })
+      setSelectedLabel((currentLabel) =>
+        getSelectedLabel(nextServices, currentLabel ?? labelsToMove[0] ?? null)
+      )
+      setSelectedTreeLabels([])
+      setTreeFolderDraft('')
+      setTreeFolderMessage(
+        labelsToMove.length === 1
+          ? `Created ${folderPath}.`
+          : `Created ${folderPath} and moved ${labelsToMove.length} services.`
+      )
+    } catch (folderError) {
+      const message = folderError instanceof Error ? folderError.message : String(folderError)
+
+      setPageError(`Folder create failed: ${message}`)
+      setTreeFolderMessage(`Folder create failed: ${message}`)
+      setCardFeedbacks((current) => ({
+        ...current,
+        ...Object.fromEntries(
+          labelsToMove.map((label) => [
+            label,
+            {
+              tone: 'error' as const,
+              message: `Folder create failed: ${message}`
+            }
+          ])
+        )
+      }))
+    } finally {
+      setTreeSelectionBusy(false)
+    }
+  }
+
+  async function handleOpenAtLoginToggle(): Promise<void> {
+    setLoginItemBusy(true)
+    setPageError(null)
+
+    try {
+      const settings = await window.launchdControl.setOpenAtLogin(!openAtLogin)
+      setOpenAtLogin(settings.openAtLogin)
+    } catch (settingsError) {
+      setPageError(settingsError instanceof Error ? settingsError.message : String(settingsError))
+    } finally {
+      setLoginItemBusy(false)
+    }
+  }
+
+  async function refreshVisibleLog(
+    label: string,
+    kind: LogKind,
+    failureOverride: ServiceActionFailure | null = actionFailures[label] ?? null
+  ): Promise<void> {
+    const nextLogs = await window.launchdControl.readLogs(label)
+    setContentPanel(buildLogPanel(nextLogs, kind, failureOverride))
+  }
+
+  async function handleAction(label: string, action: LaunchdAction): Promise<void> {
+    if (action === 'delete') {
+      const confirmed = window.confirm(
+        'Delete this launch agent plist from ~/Library/LaunchAgents?'
+      )
+
+      if (!confirmed) {
+        setCardFeedback(label, { tone: 'neutral', message: 'Delete cancelled.' })
+        return
+      }
+    }
+
+    const currentService = services.find((service) => service.label === label) ?? null
+    const actionLabel = getActionLabel(action)
+    const progressLabel = getActionProgress(action)
+
+    focusService(label)
+    setBusyLabel(label)
+    setCardFeedback(label, { tone: 'progress', message: `${progressLabel}...` })
+
+    try {
+      const nextServices = sortServices(await window.launchdControl.runAction(label, action))
+      const nextService = nextServices.find((service) => service.label === label) ?? null
+
+      setServices(nextServices)
+      setCardFeedbacks((current) => pruneCardFeedbacks(current, nextServices))
+      setActionFailures((current) => {
+        if (!(label in current)) {
+          return pruneActionFailures(current, nextServices)
+        }
+
+        const { [label]: _removed, ...rest } = current
+        return pruneActionFailures(rest, nextServices)
+      })
+      setSelectedLabel(getSelectedLabel(nextServices, label))
+
+      if (nextService) {
+        setCardFeedback(label, { tone: 'success', message: `${getActionDone(action)}.` })
+      }
+
+      if (contentPanel.mode === 'log' && contentPanel.serviceLabel === label) {
+        if (!nextService) {
+          setContentPanel(servicesPanel)
+        } else {
+          try {
+            await refreshVisibleLog(label, contentPanel.kind, null)
+          } catch {
+            // Keep the successful action feedback even if the log pane cannot refresh.
+          }
+        }
+      }
+    } catch (actionError) {
+      const message = actionError instanceof Error ? actionError.message : String(actionError)
+
+      if ((action === 'start' || action === 'restart') && currentService) {
+        const failure = buildActionFailure(currentService, action, message)
+        setActionFailures((current) => ({ ...current, [label]: failure }))
+
+        try {
+          const nextLogs = await window.launchdControl.readLogs(label)
+          const failureKind = getPreferredFailureLogKind(currentService, nextLogs)
+          setContentPanel(buildLogPanel(nextLogs, failureKind, failure))
+          setCardFeedback(label, {
+            tone: 'error',
+            message: `${actionLabel} failed. Review ${getLogButtonLabel(failureKind)} for details.`
+          })
+        } catch {
+          setCardFeedback(label, { tone: 'error', message: `${actionLabel} failed: ${message}` })
+        }
+      } else {
+        setCardFeedback(label, { tone: 'error', message: `${actionLabel} failed: ${message}` })
+      }
+    } finally {
+      setBusyLabel(null)
+    }
+  }
+
+  async function handleRename(label: string, alias: string): Promise<void> {
+    const trimmedAlias = normalizeServiceNameInput(alias)
+
+    focusService(label)
+    setBusyLabel(label)
+    setCardFeedback(label, {
+      tone: 'progress',
+      message: trimmedAlias ? 'Saving name...' : 'Clearing name...'
+    })
+
+    try {
+      const nextServices = trimmedAlias
+        ? await window.launchdControl.renameService(label, trimmedAlias)
+        : await window.launchdControl.clearAlias(label)
+      const sortedServices = sortServices(nextServices)
+
+      setServices(sortedServices)
+      setCardFeedbacks((current) => pruneCardFeedbacks(current, sortedServices))
+      setSelectedLabel(getSelectedLabel(sortedServices, label))
+      setCardFeedback(label, {
+        tone: 'success',
+        message: trimmedAlias ? 'Name updated.' : 'Name cleared.'
+      })
+
+      if (contentPanel.mode === 'log' && contentPanel.serviceLabel === label) {
+        try {
+          await refreshVisibleLog(label, contentPanel.kind)
+        } catch {
+          // The rename result is still valid if the log pane refresh fails.
+        }
+      }
+    } catch (renameError) {
+      const message = renameError instanceof Error ? renameError.message : String(renameError)
+      setCardFeedback(label, { tone: 'error', message: `Rename failed: ${message}` })
+    } finally {
+      setBusyLabel(null)
+    }
+  }
+
+  async function handleAutomationSave(
+    label: string,
+    settings: ServiceAutomationSettings
+  ): Promise<void> {
+    const hasRules =
+      Boolean(settings.startCondition) ||
+      settings.automaticStartTimes.length > 0 ||
+      settings.startOnLaunch ||
+      settings.ensureRunning
+
+    focusService(label)
+    setBusyLabel(label)
+    setCardFeedback(label, {
+      tone: 'progress',
+      message: hasRules ? 'Saving automation...' : 'Clearing automation...'
+    })
+
+    try {
+      const nextServices = sortServices(await window.launchdControl.saveAutomation(label, settings))
+
+      setServices(nextServices)
+      setCardFeedbacks((current) => pruneCardFeedbacks(current, nextServices))
+      setSelectedLabel(getSelectedLabel(nextServices, label))
+      setCardFeedback(label, {
+        tone: 'success',
+        message: hasRules ? 'Automation updated.' : 'Automation cleared.'
+      })
+    } catch (automationError) {
+      const message = automationError instanceof Error ? automationError.message : String(automationError)
+      setCardFeedback(label, { tone: 'error', message: `Automation failed: ${message}` })
+    } finally {
+      setBusyLabel(null)
+    }
+  }
+
+  async function handlePlistSave(label: string, content: string): Promise<void> {
+    focusService(label)
+    setBusyLabel(label)
+    setCardFeedback(label, {
+      tone: 'progress',
+      message: 'Saving plist...'
+    })
+
+    try {
+      const nextServices = sortServices(await window.launchdControl.savePlist(label, content))
+
+      setServices(nextServices)
+      setCardFeedbacks((current) => pruneCardFeedbacks(current, nextServices))
+      setSelectedLabel(getSelectedLabel(nextServices, label))
+      setCardFeedback(label, {
+        tone: 'success',
+        message: 'Plist saved. Restart the service to apply launchd changes.'
+      })
+    } catch (plistError) {
+      const message = plistError instanceof Error ? plistError.message : String(plistError)
+      setCardFeedback(label, { tone: 'error', message: `Plist save failed: ${message}` })
+      throw plistError
+    } finally {
+      setBusyLabel(null)
+    }
+  }
+
+  async function openLog(label: string, kind: LogKind): Promise<void> {
+    focusService(label)
+    setBusyLabel(label)
+    setCardFeedback(label, {
+      tone: 'progress',
+      message: `Loading ${getLogButtonLabel(kind)}...`
+    })
+
+    try {
+      const nextLogs = await window.launchdControl.readLogs(label)
+      const file = findLogFile(nextLogs, kind)
+
+      setContentPanel(buildLogPanel(nextLogs, kind, actionFailures[label] ?? null))
+      setCardFeedback(label, {
+        tone: file ? 'success' : 'neutral',
+        message: file
+          ? `${getLogButtonLabel(kind)} ready.`
+          : `No ${getLogButtonLabel(kind)} path declared.`
+      })
+    } catch (logsError) {
+      const message = logsError instanceof Error ? logsError.message : String(logsError)
+      setCardFeedback(label, { tone: 'error', message: `Log load failed: ${message}` })
+    } finally {
+      setBusyLabel(null)
+    }
+  }
+
+  async function closeEmbeddedTerminal(sessionId: string): Promise<void> {
+    try {
+      await window.launchdControl.closeTerminal(sessionId)
+    } catch {
+      // Closing a dead PTY should not block the rest of the UI.
+    }
+  }
+
+  async function handleOpenTerminal(): Promise<void> {
+    if (!terminalService) {
+      return
+    }
+
+    if (contentPanel.mode === 'terminal') {
+      await closeEmbeddedTerminal(contentPanel.session.id)
+    }
+
+    setBusyLabel(terminalService.label)
+    setCardFeedback(terminalService.label, {
+      tone: 'progress',
+      message: 'Opening terminal...'
+    })
+
+    try {
+      const session = await window.launchdControl.openTerminal(terminalService.label, terminalMode)
+      setContentPanel({
+        mode: 'terminal',
+        session,
+        serviceLabel: terminalService.label,
+        terminalMode
+      })
+      setCardFeedback(terminalService.label, {
+        tone: 'success',
+        message: 'Terminal ready.'
+      })
+    } catch (terminalError) {
+      const message = terminalError instanceof Error ? terminalError.message : String(terminalError)
+      setCardFeedback(terminalService.label, {
+        tone: 'error',
+        message: `Terminal failed: ${message}`
+      })
+    } finally {
+      setBusyLabel(null)
+    }
+  }
+
+  async function handleCloseTerminal(): Promise<void> {
+    if (contentPanel.mode !== 'terminal') {
+      return
+    }
+
+    await closeEmbeddedTerminal(contentPanel.session.id)
+    setContentPanel(servicesPanel)
+  }
+
+  async function handleRefreshLog(): Promise<void> {
+    if (contentPanel.mode !== 'log') {
+      return
+    }
+
+    setBusyLabel(contentPanel.serviceLabel)
+    setCardFeedback(contentPanel.serviceLabel, {
+      tone: 'progress',
+      message: `Refreshing ${getLogButtonLabel(contentPanel.kind)}...`
+    })
+
+    try {
+      await refreshVisibleLog(contentPanel.serviceLabel, contentPanel.kind)
+      setCardFeedback(contentPanel.serviceLabel, {
+        tone: 'success',
+        message: `${getLogButtonLabel(contentPanel.kind)} refreshed.`
+      })
+    } catch (refreshError) {
+      const message = refreshError instanceof Error ? refreshError.message : String(refreshError)
+      setCardFeedback(contentPanel.serviceLabel, {
+        tone: 'error',
+        message: `Log refresh failed: ${message}`
+      })
+    } finally {
+      setBusyLabel(null)
+    }
+  }
+
+  return (
+    <div className="shell">
+      <aside className="masthead">
+        <div className="masthead__intro">
+          <h1>LaunchControl</h1>
+          <p className="lede">
+            Inspect user launch agents, see launchd state at a glance, and jump straight into logs,
+            runtime context, or plist details when something needs attention.
+          </p>
+        </div>
+
+        <div className="summary-strip">
+          <article>
+            <span>Agents</span>
+            <strong>{services.length}</strong>
+          </article>
+          <article>
+            <span>Running</span>
+            <strong>{summary.running}</strong>
+          </article>
+          <article>
+            <span>Enabled</span>
+            <strong>{summary.enabled}</strong>
+          </article>
+        </div>
+
+        <div className="masthead__panels">
+          <section className="sidebar-panel">
+            <p className="section-tag">App</p>
+            <h2>Login item</h2>
+            <div className="sidebar-fields">
+              <div>
+                <span>Status</span>
+                <strong>{openAtLogin ? 'Registered with macOS' : 'Not registered'}</strong>
+              </div>
+            </div>
+            <button
+              className="ghost-button sidebar-button"
+              disabled={loginItemBusy}
+              onClick={() => void handleOpenAtLoginToggle()}
+            >
+              {loginItemBusy
+                ? 'Updating Login Item...'
+                : openAtLogin
+                  ? 'Remove from Login Items'
+                  : 'Add to Login Items'}
+            </button>
+          </section>
+        </div>
+      </aside>
+
+      <main className="workspace">
+        <header className="topbar">
+          <div className="topbar__meta">
+            <p className="section-tag">
+              {contentPanel.mode === 'log'
+                ? `${getLogButtonLabel(contentPanel.kind)} tail`
+                : contentPanel.mode === 'terminal'
+                  ? contentPanel.terminalMode === 'logs'
+                    ? 'Embedded terminal'
+                    : 'Embedded shell'
+                : 'Service roster'}
+            </p>
+            <h2>
+              {contentPanel.mode === 'log'
+                ? 'Log window'
+                : contentPanel.mode === 'terminal'
+                  ? 'Embedded terminal'
+                  : 'User launch agents'}
+            </h2>
+            <p className="topbar__detail">
+              {contentPanel.mode === 'log'
+                ? contentPanel.title
+                : contentPanel.mode === 'terminal'
+                  ? contentPanel.session.title
+                : searchActive
+                  ? `${filteredServices.length} matching service${
+                      filteredServices.length === 1 ? '' : 's'
+                    }`
+                  : `${services.length} service${services.length === 1 ? '' : 's'} in the roster`}
+            </p>
+          </div>
+
+          <div className="topbar__controls">
+            {contentPanel.mode === 'services' ? (
+              <label className="search-field">
+                <span className="search-field__icon">
+                  <Search />
+                </span>
+                <input
+                  aria-label="Search services"
+                  className="search-field__input"
+                  onChange={(event) => setSearchQuery(event.target.value)}
+                  placeholder="Search by name, label, plist, or state"
+                  value={searchQuery}
+                />
+                {searchQuery ? (
+                  <button
+                    aria-label="Clear search"
+                    className="icon-button icon-button--small search-field__clear"
+                    onClick={() => setSearchQuery('')}
+                    type="button"
+                  >
+                    <X />
+                  </button>
+                ) : null}
+              </label>
+            ) : null}
+
+            <div className="topbar__actions">
+              {contentPanel.mode === 'services' ? (
+                <div className="topbar__view-toggle" role="group" aria-label="Service view">
+                  <button
+                    aria-label="Grid view"
+                    className={`ghost-button topbar-button ${serviceViewMode === 'grid' ? 'is-active' : ''}`}
+                    onClick={() => setServiceViewMode('grid')}
+                    title="Grid view"
+                    type="button"
+                  >
+                    <span className="button-icon">
+                      <LayoutGrid />
+                    </span>
+                    <span className="button-label">Grid</span>
+                  </button>
+                  <button
+                    aria-label="List view"
+                    className={`ghost-button topbar-button ${serviceViewMode === 'tree' ? 'is-active' : ''}`}
+                    onClick={() => setServiceViewMode('tree')}
+                    title="List view"
+                    type="button"
+                  >
+                    <span className="button-icon">
+                      <ListTree />
+                    </span>
+                    <span className="button-label">List</span>
+                  </button>
+                </div>
+              ) : null}
+              {contentPanel.mode === 'log' || contentPanel.mode === 'terminal' ? (
+                <button
+                  aria-label="Back to services"
+                  className="ghost-button toolbar-button topbar-button"
+                  onClick={() => {
+                    if (contentPanel.mode === 'terminal') {
+                      void handleCloseTerminal()
+                      return
+                    }
+
+                    setContentPanel(servicesPanel)
+                  }}
+                  title="Back to services"
+                >
+                  <span className="button-icon">
+                    <ArrowLeft />
+                  </span>
+                  <span className="button-label">Back to services</span>
+                </button>
+              ) : null}
+              {contentPanel.mode === 'log' ? (
+                alternateLogKind ? (
+                  <button
+                    aria-label={`Show ${getLogButtonLabel(alternateLogKind)}`}
+                    className="ghost-button toolbar-button topbar-button"
+                    disabled={busyLabel === contentPanel.serviceLabel}
+                    onClick={() => void openLog(contentPanel.serviceLabel, alternateLogKind)}
+                    title={`Show ${getLogButtonLabel(alternateLogKind)}`}
+                    type="button"
+                  >
+                    <span className="button-icon">
+                      <FileText />
+                    </span>
+                    <span className="button-label">{getLogButtonLabel(alternateLogKind)}</span>
+                  </button>
+                ) : null
+              ) : null}
+              {contentPanel.mode === 'log' ? (
+                <button
+                  aria-label="Refresh log"
+                  className="ghost-button toolbar-button topbar-button"
+                  disabled={busyLabel === contentPanel.serviceLabel}
+                  onClick={() => void handleRefreshLog()}
+                  title="Refresh log"
+                  type="button"
+                >
+                  <span className="button-icon">
+                    <RefreshCcw />
+                  </span>
+                  <span className="button-label">Refresh log</span>
+                </button>
+              ) : null}
+              {contentPanel.mode === 'services' ? (
+                <button
+                  aria-label="Refresh snapshot"
+                  className="ghost-button toolbar-button topbar-button"
+                  disabled={loading}
+                  onClick={() => void loadServices()}
+                  title="Refresh snapshot"
+                  type="button"
+                >
+                  <span className="button-icon">
+                    <RefreshCcw />
+                  </span>
+                  <span className="button-label">Refresh snapshot</span>
+                </button>
+              ) : null}
+              {terminalService ? (
+                <button
+                  aria-label="Open terminal"
+                  className="ghost-button toolbar-button topbar-button"
+                  disabled={busyLabel === terminalService.label}
+                  onClick={() => void handleOpenTerminal()}
+                  title="Open terminal"
+                  type="button"
+                >
+                  <span className="button-icon">
+                    <Terminal />
+                  </span>
+                  <span className="button-label">Open terminal</span>
+                </button>
+              ) : null}
+            </div>
+          </div>
+        </header>
+
+        {pageError ? <div className="error-banner">{pageError}</div> : null}
+
+        <section className="service-region">
+          {loading ? (
+            <div className="empty-state">Loading launch agents...</div>
+          ) : contentPanel.mode === 'log' ? (
+            <LogPanel
+              busy={busyLabel === contentPanel.serviceLabel}
+              onAction={handleAction}
+              onLog={openLog}
+              onOpenTerminal={() => void handleOpenTerminal()}
+              panel={contentPanel}
+              service={logService}
+            />
+          ) : contentPanel.mode === 'terminal' ? (
+            <TerminalPanel
+              panel={contentPanel}
+              service={terminalService}
+              onBack={() => void handleCloseTerminal()}
+            />
+          ) : services.length === 0 ? (
+            <div className="empty-state">
+              No `~/Library/LaunchAgents` plists were found for this user.
+            </div>
+          ) : filteredServices.length === 0 ? (
+            <div className="empty-state">
+              No services matched `{deferredSearchQuery.trim()}`.
+            </div>
+          ) : serviceViewMode === 'tree' ? (
+            <div className="service-layout">
+              <article className="tree-panel">
+                <header className="tree-panel__header">
+                  <div>
+                    <p className="eyebrow">Service tree</p>
+                    <h3>Grouped agents</h3>
+                  </div>
+                  <p className="tree-panel__hint">
+                    Press `/` to create a folder from the checked services. If nothing is checked,
+                    the active service moves into the new folder.
+                  </p>
+                  <div
+                    className="tree-folder-command"
+                  >
+                    <label className="tree-folder-command__field">
+                      <span>/</span>
+                      <input
+                        ref={treeFolderInputRef}
+                        aria-label="Folder path"
+                        disabled={treeSelectionBusy}
+                        onChange={(event) => {
+                          setTreeFolderDraft(event.target.value)
+                          setTreeFolderMessage(null)
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') {
+                            void createTreeFolderFromSelection()
+                          }
+                        }}
+                        placeholder="Folder path"
+                        value={treeFolderDraft}
+                      />
+                    </label>
+                    <button
+                      className="ghost-button"
+                      disabled={treeSelectionBusy}
+                      onClick={() => void createTreeFolderFromSelection()}
+                      type="button"
+                    >
+                      Create folder
+                    </button>
+                  </div>
+                  {treeFolderMessage ? (
+                    <p className="tree-folder-command__message">{treeFolderMessage}</p>
+                  ) : null}
+                  {selectedTreeLabels.length > 0 ? (
+                    <div className="tree-panel__selection">
+                      <p>
+                        {treeSelectionBusy
+                          ? `Moving ${selectedTreeLabels.length} selected service${
+                              selectedTreeLabels.length === 1 ? '' : 's'
+                            }...`
+                          : `${selectedTreeLabels.length} selected. Click a folder to move them inside LaunchControl only. This never changes ~/Library/LaunchAgents.`}
+                      </p>
+                      <button
+                        className="ghost-button"
+                        disabled={treeSelectionBusy}
+                        onClick={() => clearTreeSelection()}
+                        type="button"
+                      >
+                        Clear selection
+                      </button>
+                    </div>
+                  ) : null}
+                </header>
+
+                <ServiceTree
+                  activeLabel={selectedService?.label ?? null}
+                  expandedFolders={expandedFolders}
+                  nodes={serviceTree}
+                  onMoveSelection={moveTreeSelectionToFolder}
+                  onSelect={focusService}
+                  onToggleSelection={toggleTreeSelection}
+                  onToggleFolder={toggleFolder}
+                  selectedLabels={selectedTreeLabels}
+                  selectionBusy={treeSelectionBusy}
+                  servicesByLabel={servicesByLabel}
+                />
+              </article>
+
+              <TreeServiceDetail
+                busyLabel={busyLabel}
+                feedbacks={cardFeedbacks}
+                onAction={handleAction}
+                onLog={openLog}
+                onRename={handleRename}
+                onSaveAutomation={handleAutomationSave}
+                onSavePlist={handlePlistSave}
+                onSelect={focusService}
+                service={selectedService}
+                services={services}
+              />
+            </div>
+          ) : (
+            <div className="service-grid">
+              {filteredServices.map((service, index) => (
+                <ServiceCard
+                  key={service.label}
+                  active={service.label === selectedService?.label}
+                  allServices={services}
+                  busy={busyLabel === service.label}
+                  delayIndex={index}
+                  feedback={cardFeedbacks[service.label] ?? getDefaultCardFeedback(service)}
+                  onAction={handleAction}
+                  onLog={openLog}
+                  onRename={handleRename}
+                  onSelect={focusService}
+                  service={service}
+                />
+              ))}
+            </div>
+          )}
+        </section>
+      </main>
+    </div>
+  )
+}
+
+function TreeServiceDetail({
+  service,
+  services,
+  busyLabel,
+  feedbacks,
+  onSelect,
+  onAction,
+  onRename,
+  onLog,
+  onSaveAutomation,
+  onSavePlist
+}: {
+  service: LaunchdService | null
+  services: LaunchdService[]
+  busyLabel: string | null
+  feedbacks: Record<string, CardFeedback>
+  onSelect: (label: string) => void
+  onAction: (label: string, action: LaunchdAction) => Promise<void>
+  onRename: (label: string, alias: string) => Promise<void>
+  onLog: (label: string, kind: LogKind) => Promise<void>
+  onSaveAutomation: (label: string, settings: ServiceAutomationSettings) => Promise<void>
+  onSavePlist: (label: string, content: string) => Promise<void>
+}): JSX.Element {
+  if (!service) {
+    return (
+      <div className="service-detail service-detail--tree">
+        <div className="empty-state">Select a service in the tree to view its details.</div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="service-detail service-detail--tree">
+      <section className="detail-panel">
+        <header className="detail-panel__header">
+          <p className="eyebrow">Selection</p>
+          <h3>{service.name}</h3>
+          <p className="detail-panel__summary">{getServiceStateSummary(service)}</p>
+        </header>
+
+        <div className="detail-fields">
+          <div>
+            <span>Label</span>
+            <strong>{service.label}</strong>
+          </div>
+          <div>
+            <span>Launchd</span>
+            <strong>{service.enabled ? 'Enabled' : 'Disabled'}</strong>
+          </div>
+          <div>
+            <span>Plist</span>
+            <strong>{service.plistName ?? 'Not managed by this app'}</strong>
+            {service.serviceInfo ? <em className="detail-panel__copy">{service.serviceInfo}</em> : null}
+          </div>
+          <div>
+            <span>Output</span>
+            <strong>
+              {service.logTargets.find((target) => target.kind === 'stdout')?.path ?? 'Not declared'}
+            </strong>
+          </div>
+          <div>
+            <span>Err</span>
+            <strong>
+              {service.logTargets.find((target) => target.kind === 'stderr')?.path ?? 'Not declared'}
+            </strong>
+          </div>
+        </div>
+      </section>
+
+      <ServiceCard
+        active
+        allServices={services}
+        busy={busyLabel === service.label}
+        delayIndex={0}
+        feedback={feedbacks[service.label] ?? getDefaultCardFeedback(service)}
+        onAction={onAction}
+        onLog={onLog}
+        onRename={onRename}
+        onSelect={onSelect}
+        service={service}
+      />
+
+      <section className="detail-panel">
+        <header className="detail-panel__header">
+          <p className="eyebrow">Automation</p>
+          <h3>Rules</h3>
+          <p className="detail-panel__summary">{summarizeAutomation(service, services)}</p>
+        </header>
+
+        <AutomationPanel
+          busy={busyLabel === service.label}
+          onSave={onSaveAutomation}
+          service={service}
+          services={services}
+        />
+      </section>
+
+      <LaunchdPlistEditorPanel
+        busy={busyLabel === service.label}
+        onSave={onSavePlist}
+        service={service}
+      />
+    </div>
+  )
+}
+
+function LaunchdPlistEditorPanel({
+  service,
+  busy,
+  onSave
+}: {
+  service: LaunchdService
+  busy: boolean
+  onSave: (label: string, content: string) => Promise<void>
+}): JSX.Element {
+  const [document, setDocument] = useState<LaunchdPlistDocument | null>(null)
+  const [draftContent, setDraftContent] = useState('')
+  const [editing, setEditing] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [localMessage, setLocalMessage] = useState<string | null>(null)
+  const [copiedSnippetKey, setCopiedSnippetKey] = useState<string | null>(null)
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const selectionRef = useRef({ start: 0, end: 0 })
+  const dirty = document !== null && draftContent !== document.plistContent
+
+  useEffect(() => {
+    let cancelled = false
+
+    setLoading(true)
+    setEditing(false)
+    setError(null)
+    setDocument(null)
+    setDraftContent('')
+    setLocalMessage(null)
+    setCopiedSnippetKey(null)
+    selectionRef.current = { start: 0, end: 0 }
+
+    void window.launchdControl
+      .readPlist(service.label)
+      .then((nextDocument) => {
+        if (cancelled) {
+          return
+        }
+
+        setDocument(nextDocument)
+        setDraftContent(nextDocument.plistContent)
+      })
+      .catch((documentError) => {
+        if (cancelled) {
+          return
+        }
+
+        setError(documentError instanceof Error ? documentError.message : String(documentError))
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoading(false)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [service])
+
+  useEffect(() => {
+    if (!copiedSnippetKey) {
+      return
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setCopiedSnippetKey(null)
+    }, 1800)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [copiedSnippetKey])
+
+  useEffect(() => {
+    if (!editing) {
+      return
+    }
+
+    window.requestAnimationFrame(() => {
+      const textarea = textareaRef.current
+
+      if (!textarea) {
+        return
+      }
+
+      textarea.focus()
+      const { start, end } = selectionRef.current
+      const cursor = Number.isFinite(start) ? start : draftContent.length
+      textarea.setSelectionRange(cursor, Number.isFinite(end) ? end : cursor)
+    })
+  }, [editing])
+
+  function syncSelection(target: HTMLTextAreaElement): void {
+    selectionRef.current = {
+      start: target.selectionStart,
+      end: target.selectionEnd
+    }
+  }
+
+  function beginEdit(): void {
+    if (!document) {
+      return
+    }
+
+    setDraftContent(document.plistContent)
+    selectionRef.current = {
+      start: document.plistContent.length,
+      end: document.plistContent.length
+    }
+    setError(null)
+    setLocalMessage(null)
+    setEditing(true)
+  }
+
+  function cancelEdit(): void {
+    setDraftContent(document?.plistContent ?? '')
+    setError(null)
+    setLocalMessage(null)
+    setCopiedSnippetKey(null)
+    setEditing(false)
+  }
+
+  async function handleSnippetCopy(snippet: LaunchdPlistSnippet): Promise<void> {
+    try {
+      await copyTextToClipboard(snippet.snippet)
+      setCopiedSnippetKey(snippet.key)
+      setError(null)
+      setLocalMessage(`Copied ${snippet.title}.`)
+    } catch (copyError) {
+      setError(copyError instanceof Error ? copyError.message : String(copyError))
+    }
+  }
+
+  function insertSnippet(snippet: LaunchdPlistSnippet): void {
+    const textarea = textareaRef.current
+    const selectionStart = textarea?.selectionStart ?? selectionRef.current.start
+    const selectionEnd = textarea?.selectionEnd ?? selectionRef.current.end
+    const textToInsert = snippet.insertText ?? snippet.snippet
+    const head = draftContent.slice(0, selectionStart)
+    const tail = draftContent.slice(selectionEnd)
+    const prefix = head.length > 0 && !head.endsWith('\n') ? '\n' : ''
+    const suffix = tail.length > 0 && !tail.startsWith('\n') ? '\n' : ''
+    const inserted = `${prefix}${textToInsert}${suffix}`
+    const nextContent = `${head}${inserted}${tail}`
+    const cursor = head.length + inserted.length
+
+    setDraftContent(nextContent)
+    setError(null)
+    setLocalMessage(`Inserted ${snippet.title} at the cursor.`)
+    selectionRef.current = { start: cursor, end: cursor }
+
+    window.requestAnimationFrame(() => {
+      const nextTextarea = textareaRef.current
+
+      if (!nextTextarea) {
+        return
+      }
+
+      nextTextarea.focus()
+      nextTextarea.setSelectionRange(cursor, cursor)
+    })
+  }
+
+  function handleSnippetKeyDown(
+    event: KeyboardEvent<HTMLElement>,
+    snippet: LaunchdPlistSnippet
+  ): void {
+    if (event.key !== 'Enter' && event.key !== ' ') {
+      return
+    }
+
+    event.preventDefault()
+    void handleSnippetCopy(snippet)
+  }
+
+  async function submit(): Promise<void> {
+    if (!document) {
+      return
+    }
+
+    setError(null)
+    setLocalMessage(null)
+
+    try {
+      await onSave(service.label, draftContent)
+      setDocument((current) =>
+        current
+          ? {
+              ...current,
+              plistContent: draftContent,
+              generatedAt: new Date().toISOString()
+            }
+          : current
+      )
+      setLocalMessage('Saved to disk. launchd reads changes after the agent is reloaded or restarted.')
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : String(saveError))
+    }
+  }
+
+  return (
+    <section className="detail-panel source-panel">
+      <header className="detail-panel__header detail-panel__header--split">
+        <div>
+          <p className="eyebrow">{editing ? 'Plist editor' : 'Plist overview'}</p>
+          <h3>Launchd plist</h3>
+          <p className="detail-panel__summary">
+            {loading ? 'Loading plist...' : (document?.plistPath ?? 'Plist unavailable.')}
+          </p>
+        </div>
+        {!loading && document ? (
+          editing ? (
+            <button className="ghost-button" onClick={() => cancelEdit()} type="button">
+              Close editor
+            </button>
+          ) : (
+            <button className="ghost-button" onClick={() => beginEdit()} type="button">
+              Edit plist
+            </button>
+          )
+        ) : null}
+      </header>
+
+      {error ? <div className="error-banner">{error}</div> : null}
+      {loading ? <div className="empty-state">Loading plist...</div> : null}
+      {!loading && document ? (
+        <div className={`plist-editor ${editing ? 'is-editing' : 'is-reading'}`}>
+          {editing ? (
+            <div className="plist-editor__workspace">
+              <label className="field-group">
+                <span>Raw plist XML</span>
+                <textarea
+                  ref={textareaRef}
+                  className="plist-editor__textarea"
+                  onChange={(event) => {
+                    setDraftContent(event.target.value)
+                    syncSelection(event.target)
+                    setError(null)
+                    setLocalMessage(null)
+                  }}
+                  onClick={(event) => syncSelection(event.currentTarget)}
+                  onKeyUp={(event) => syncSelection(event.currentTarget)}
+                  onSelect={(event) => syncSelection(event.currentTarget)}
+                  spellCheck={false}
+                  value={draftContent}
+                />
+              </label>
+
+              <aside className="plist-library" aria-label="launchd plist snippets">
+                <header className="plist-library__header">
+                  <h4>Insert library</h4>
+                  <p>Copy a snippet or insert it at the cursor.</p>
+                </header>
+
+                <div className="plist-library__list">
+                  {[
+                    { key: 'plist', title: '.plist keys', snippets: launchdPlistLibrary },
+                    { key: 'launchd', title: 'launchd commands', snippets: launchdCommandLibrary }
+                  ].map((section) => (
+                    <section key={section.key} className="plist-library__section">
+                      <h5>{section.title}</h5>
+                      {section.snippets.map((snippet) => {
+                        const copied = copiedSnippetKey === snippet.key
+
+                        return (
+                          <article
+                            key={snippet.key}
+                            aria-label={`${snippet.title} snippet`}
+                            className={`plist-snippet-card ${copied ? 'is-copied' : ''}`}
+                            onClick={() => void handleSnippetCopy(snippet)}
+                            onKeyDown={(event) => handleSnippetKeyDown(event, snippet)}
+                            role="button"
+                            tabIndex={0}
+                          >
+                            <div className="plist-snippet-card__header">
+                              <div>
+                                <strong>{snippet.title}</strong>
+                                <p>{snippet.description}</p>
+                              </div>
+                              <span className="plist-snippet-card__badge">
+                                {copied ? 'Copied' : 'Copy'}
+                              </span>
+                            </div>
+                            <pre className="plist-snippet-card__preview">{snippet.snippet}</pre>
+                            <button
+                              className="ghost-button sidebar-button"
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                insertSnippet(snippet)
+                              }}
+                              type="button"
+                            >
+                              Insert
+                            </button>
+                          </article>
+                        )
+                      })}
+                    </section>
+                  ))}
+                </div>
+              </aside>
+            </div>
+          ) : (
+            <div className="plist-read">
+              <pre className="source-panel__content plist-read__preview">{document.plistContent}</pre>
+            </div>
+          )}
+
+          {localMessage ? <p className="sidebar-detail">{localMessage}</p> : null}
+
+          {editing ? (
+            <div className="panel-actions plist-editor__actions">
+              <button
+                className="ghost-button sidebar-button"
+                disabled={busy || !dirty}
+                onClick={() => void submit()}
+                type="button"
+              >
+                {busy ? 'Saving plist...' : 'Save plist'}
+              </button>
+              <button
+                className="ghost-button sidebar-button"
+                disabled={busy || !dirty || !document}
+                onClick={() => {
+                  setDraftContent(document?.plistContent ?? '')
+                  setError(null)
+                  setLocalMessage('Reverted to the on-disk plist.')
+                  selectionRef.current = {
+                    start: document?.plistContent.length ?? 0,
+                    end: document?.plistContent.length ?? 0
+                  }
+                }}
+                type="button"
+              >
+                Revert changes
+              </button>
+              <button
+                className="ghost-button sidebar-button"
+                disabled={busy}
+                onClick={() => cancelEdit()}
+                type="button"
+              >
+                Cancel edit
+              </button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  )
+}
+
+function ServiceTree({
+  nodes,
+  activeLabel,
+  expandedFolders,
+  selectedLabels,
+  selectionBusy,
+  servicesByLabel,
+  onMoveSelection,
+  onSelect,
+  onToggleSelection,
+  onToggleFolder,
+  level = 0
+}: {
+  nodes: ServiceTreeNode[]
+  activeLabel: string | null
+  expandedFolders: Record<string, boolean>
+  selectedLabels: string[]
+  selectionBusy: boolean
+  servicesByLabel: Record<string, LaunchdService>
+  onMoveSelection: (folderPath: string) => Promise<void>
+  onSelect: (label: string) => void
+  onToggleSelection: (label: string) => void
+  onToggleFolder: (path: string) => void
+  level?: number
+}): JSX.Element {
+  const selectedSet = new Set(selectedLabels)
+
+  return (
+    <ul className="service-tree">
+      {nodes.map((node) => {
+        const rowStyle = { '--tree-level': level } as CSSProperties
+
+        if (node.type === 'folder') {
+          const expanded = expandedFolders[node.path] ?? true
+          const canMoveSelection =
+            !selectionBusy &&
+            selectedLabels.length > 0 &&
+            selectedLabels.some((label) => {
+              const service = servicesByLabel[label]
+              return service ? getServiceFolderPath(service) !== node.path : false
+            })
+
+          const handleFolderClick = (): void => {
+            if (canMoveSelection) {
+              void onMoveSelection(node.path)
+              return
+            }
+
+            onToggleFolder(node.path)
+          }
+
+          return (
+            <li key={node.path}>
+              <div
+                aria-expanded={expanded}
+                className={`tree-row tree-row--folder ${canMoveSelection ? 'is-drop-target' : ''}`}
+                onClick={handleFolderClick}
+                onKeyDown={(event) => handleTreeRowKeyDown(event, handleFolderClick)}
+                role="button"
+                style={rowStyle}
+                tabIndex={0}
+              >
+                <button
+                  aria-label={expanded ? `Collapse ${node.name}` : `Expand ${node.name}`}
+                  className="tree-row__slot-button"
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    onToggleFolder(node.path)
+                  }}
+                  type="button"
+                >
+                  <span className={`tree-row__caret ${expanded ? 'is-expanded' : ''}`}>
+                    <ChevronRight />
+                  </span>
+                </button>
+                <span aria-hidden="true" className="tree-row__status tree-row__status--placeholder" />
+                <span className="tree-row__icon">
+                  <Folder />
+                </span>
+                <span className="tree-row__label">{node.name}</span>
+                <span className="tree-row__meta">
+                  {canMoveSelection
+                    ? `Move ${selectedLabels.length} here`
+                    : node.runningCount > 0
+                      ? `${node.runningCount}/${node.serviceCount} running`
+                      : `${node.serviceCount} item${node.serviceCount === 1 ? '' : 's'}`}
+                </span>
+              </div>
+              {expanded ? (
+                <ServiceTree
+                  activeLabel={activeLabel}
+                  expandedFolders={expandedFolders}
+                  level={level + 1}
+                  nodes={node.children}
+                  onMoveSelection={onMoveSelection}
+                  onSelect={onSelect}
+                  onToggleSelection={onToggleSelection}
+                  onToggleFolder={onToggleFolder}
+                  selectedLabels={selectedLabels}
+                  selectionBusy={selectionBusy}
+                  servicesByLabel={servicesByLabel}
+                />
+              ) : null}
+            </li>
+          )
+        }
+
+        const isSelected = selectedSet.has(node.service.label)
+        const handleServiceClick = (): void => onSelect(node.service.label)
+
+        return (
+          <li key={node.path}>
+            <div
+              className={`tree-row tree-row--service ${
+                node.service.label === activeLabel ? 'is-active' : ''
+              } ${isSelected ? 'is-selected' : ''}`}
+              onClick={handleServiceClick}
+              onKeyDown={(event) => handleTreeRowKeyDown(event, handleServiceClick)}
+              role="button"
+              style={rowStyle}
+              tabIndex={0}
+            >
+              <button
+                aria-label={isSelected ? `Deselect ${node.leafName}` : `Select ${node.leafName}`}
+                aria-pressed={isSelected}
+                className={`tree-row__slot-button tree-row__slot-button--checkbox ${
+                  isSelected ? 'is-selected' : ''
+                }`}
+                disabled={selectionBusy}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onToggleSelection(node.service.label)
+                }}
+                type="button"
+              >
+                {isSelected ? <Check /> : <Square />}
+              </button>
+              <span className={`tree-row__status is-${node.service.status}`} />
+              <span className="tree-row__icon">
+                <FileText />
+              </span>
+              <span className="tree-row__label">{node.leafName}</span>
+              <span className="tree-row__meta">{isSelected ? 'selected' : node.service.status}</span>
+            </div>
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
+function AutomationPanel({
+  service,
+  services,
+  busy,
+  onSave
+}: {
+  service: LaunchdService | null
+  services: LaunchdService[]
+  busy: boolean
+  onSave: (label: string, settings: ServiceAutomationSettings) => Promise<void>
+}): JSX.Element {
+  const [afterLabel, setAfterLabel] = useState('')
+  const [waitFor, setWaitFor] = useState<StartConditionState>('running')
+  const [delaySeconds, setDelaySeconds] = useState('0')
+  const [automaticStartTimes, setAutomaticStartTimes] = useState('')
+  const [startOnLaunch, setStartOnLaunch] = useState(false)
+  const [launchDelaySeconds, setLaunchDelaySeconds] = useState('0')
+  const [ensureRunning, setEnsureRunning] = useState(false)
+  const [localError, setLocalError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!service) {
+      setAfterLabel('')
+      setWaitFor('running')
+      setDelaySeconds('0')
+      setAutomaticStartTimes('')
+      setStartOnLaunch(false)
+      setLaunchDelaySeconds('0')
+      setEnsureRunning(false)
+      setLocalError(null)
+      return
+    }
+
+    setAfterLabel(service.automation.startCondition?.afterLabel ?? '')
+    setWaitFor(service.automation.startCondition?.waitFor ?? 'running')
+    setDelaySeconds(String(service.automation.startCondition?.delaySeconds ?? 0))
+    setAutomaticStartTimes(service.automation.automaticStartTimes.join(', '))
+    setStartOnLaunch(service.automation.startOnLaunch)
+    setLaunchDelaySeconds(String(service.automation.launchDelaySeconds))
+    setEnsureRunning(service.automation.ensureRunning)
+    setLocalError(null)
+  }, [service])
+
+  if (!service) {
+    return <p className="sidebar-empty">Select a service to configure automation.</p>
+  }
+
+  const currentService = service
+  const availableServices = services.filter((candidate) => candidate.label !== service.label)
+
+  async function submit(): Promise<void> {
+    const parsedDelay = Number(delaySeconds)
+    const parsedLaunchDelay = Number(launchDelaySeconds)
+
+    if (!Number.isFinite(parsedDelay) || parsedDelay < 0) {
+      setLocalError('Delay must be a non-negative number of seconds.')
+      return
+    }
+
+    if (!Number.isFinite(parsedLaunchDelay) || parsedLaunchDelay < 0) {
+      setLocalError('Launch delay must be a non-negative number of seconds.')
+      return
+    }
+
+    const parsedTimes = parseAutomaticStartTimes(automaticStartTimes)
+
+    if (parsedTimes.invalidEntries.length > 0) {
+      setLocalError(`Invalid time values: ${parsedTimes.invalidEntries.join(', ')}`)
+      return
+    }
+
+    setLocalError(null)
+    await onSave(currentService.label, {
+      startCondition: afterLabel
+        ? {
+            afterLabel,
+            waitFor,
+            delaySeconds: Math.round(parsedDelay)
+          }
+        : null,
+      automaticStartTimes: parsedTimes.times,
+      startOnLaunch,
+      launchDelaySeconds: startOnLaunch ? Math.round(parsedLaunchDelay) : 0,
+      ensureRunning
+    })
+  }
+
+  return (
+    <div className="automation-panel">
+      <p className="sidebar-detail">
+        Rules run while LaunchControl is open. They apply to any launch agent this app manages,
+        including agents whose plist launches a `.sh` script. Add LaunchControl to Login Items if
+        you want these starts to act like a system-load scheduler.
+      </p>
+
+      <div className="automation-fields">
+        <label aria-label="Start when LaunchControl opens" className="toggle-field">
+          <input
+            checked={startOnLaunch}
+            onChange={(event) => setStartOnLaunch(event.target.checked)}
+            type="checkbox"
+          />
+          <span>
+            <strong>Start when LaunchControl opens</strong>
+            <em>Useful for post-login staging when this app is registered as a Login Item.</em>
+          </span>
+        </label>
+
+        <label className="field-group">
+          <span>Launch delay (sec)</span>
+          <input
+            disabled={!startOnLaunch}
+            inputMode="numeric"
+            min="0"
+            onChange={(event) => setLaunchDelaySeconds(event.target.value)}
+            type="number"
+            value={launchDelaySeconds}
+          />
+        </label>
+
+        <label className="field-group">
+          <span>Start after</span>
+          <select value={afterLabel} onChange={(event) => setAfterLabel(event.target.value)}>
+            <option value="">No dependency</option>
+            {availableServices.map((candidate) => (
+              <option key={candidate.label} value={candidate.label}>
+                {candidate.name}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <div className="field-grid">
+          <label className="field-group">
+            <span>Wait for</span>
+            <select
+              disabled={!afterLabel}
+              value={waitFor}
+              onChange={(event) =>
+                setWaitFor(event.target.value === 'loaded' ? 'loaded' : 'running')
+              }
+            >
+              <option value="running">Running</option>
+              <option value="loaded">Loaded</option>
+            </select>
+          </label>
+
+          <label className="field-group">
+            <span>Delay (sec)</span>
+            <input
+              disabled={!afterLabel}
+              inputMode="numeric"
+              min="0"
+              onChange={(event) => setDelaySeconds(event.target.value)}
+              type="number"
+              value={delaySeconds}
+            />
+          </label>
+        </div>
+
+        <label className="field-group">
+          <span>Daily auto-start times</span>
+          <input
+            onChange={(event) => setAutomaticStartTimes(event.target.value)}
+            placeholder="09:00, 17:30"
+            value={automaticStartTimes}
+          />
+        </label>
+
+        <label aria-label="Keep this service running" className="toggle-field">
+          <input
+            checked={ensureRunning}
+            onChange={(event) => setEnsureRunning(event.target.checked)}
+            type="checkbox"
+          />
+          <span>
+            <strong>Keep this service running</strong>
+            <em>LaunchControl will try to restart it whenever it is enabled but not running.</em>
+          </span>
+        </label>
+      </div>
+
+      <p className="sidebar-detail">{summarizeAutomation(currentService, services)}</p>
+      {localError ? <p className="form-error">{localError}</p> : null}
+
+      <div className="panel-actions">
+        <button className="ghost-button sidebar-button" disabled={busy} onClick={() => void submit()}>
+          {busy ? 'Saving automation...' : 'Save automation'}
+        </button>
+        <button
+          className="ghost-button sidebar-button"
+          disabled={busy}
+          onClick={() => {
+            setAfterLabel('')
+            setWaitFor('running')
+            setDelaySeconds('0')
+            setAutomaticStartTimes('')
+            setStartOnLaunch(false)
+            setLaunchDelaySeconds('0')
+            setEnsureRunning(false)
+            setLocalError(null)
+            void onSave(currentService.label, {
+              startCondition: null,
+              automaticStartTimes: [],
+              startOnLaunch: false,
+              launchDelaySeconds: 0,
+              ensureRunning: false
+            })
+          }}
+        >
+          Clear automation
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function ServiceCard({
+  service,
+  allServices,
+  active,
+  busy,
+  feedback,
+  delayIndex,
+  onSelect,
+  onAction,
+  onRename,
+  onLog
+}: {
+  service: LaunchdService
+  allServices: LaunchdService[]
+  active: boolean
+  busy: boolean
+  feedback: CardFeedback
+  delayIndex: number
+  onSelect: (label: string) => void
+  onAction: (label: string, action: LaunchdAction) => Promise<void>
+  onRename: (label: string, alias: string) => Promise<void>
+  onLog: (label: string, kind: LogKind) => Promise<void>
+}): JSX.Element {
+  const [draftName, setDraftName] = useState(service.name)
+  const [editing, setEditing] = useState(false)
+  const titleInputRef = useRef<HTMLInputElement | null>(null)
+  const cardStyle = {
+    '--delay': `${delayIndex * 55}ms`,
+    '--service-title-size': getAdaptiveTitleSize(service.name)
+  } as CSSProperties
+
+  useEffect(() => {
+    if (!editing) {
+      setDraftName(service.name)
+    }
+  }, [editing, service.name])
+
+  useEffect(() => {
+    if (!editing) {
+      return
+    }
+
+    window.requestAnimationFrame(() => {
+      titleInputRef.current?.focus()
+      titleInputRef.current?.select()
+    })
+  }, [editing])
+
+  function submitRename(): void {
+    setEditing(false)
+    const nextAlias = resolveServiceAliasInput(service, draftName)
+    void onRename(service.label, nextAlias === service.label ? '' : nextAlias)
+  }
+
+  function handleKeyDown(event: KeyboardEvent<HTMLInputElement>): void {
+    if (event.key === 'Enter') {
+      submitRename()
+      return
+    }
+
+    if (event.key === 'Escape') {
+      setDraftName(service.name)
+      setEditing(false)
+    }
+  }
+
+  return (
+    <article
+      className={`service-card status-${service.status} feedback-${feedback.tone} ${
+        active ? 'is-active' : ''
+      }`}
+      onClick={() => onSelect(service.label)}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) {
+          return
+        }
+
+        handleTreeRowKeyDown(event, () => onSelect(service.label))
+      }}
+      role="button"
+      style={cardStyle}
+      tabIndex={0}
+    >
+      <div className="service-card__body">
+        <div className="service-card__title-row">
+          <div className="service-card__headline">
+            <span className={`status-pill is-${service.status}`}>{service.status}</span>
+
+            {editing ? (
+              <div className="title-editor">
+                <input
+                  ref={titleInputRef}
+                  className="title-editor__input"
+                  onChange={(event) => setDraftName(event.target.value)}
+                  placeholder="Use / to create folders"
+                  onKeyDown={handleKeyDown}
+                  value={draftName}
+                />
+                <button
+                  aria-label="Save name"
+                  className="icon-button icon-button--small"
+                  disabled={busy}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    submitRename()
+                  }}
+                >
+                  <Check />
+                </button>
+                <button
+                  aria-label="Cancel rename"
+                  className="icon-button icon-button--small"
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    setDraftName(service.name)
+                    setEditing(false)
+                  }}
+                >
+                  <X />
+                </button>
+              </div>
+            ) : (
+              <div className="title-display">
+                <h3>{service.name}</h3>
+                <button
+                  aria-label="Edit name"
+                  className="icon-button icon-button--small"
+                  disabled={busy}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    setDraftName(service.name)
+                    setEditing(true)
+                  }}
+                  title="Edit name"
+                >
+                  <Pencil />
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <p className="service-card__label">{service.plistName ?? service.label}</p>
+        {service.serviceInfo ? <p className="service-card__info">{service.serviceInfo}</p> : null}
+        <div className="service-card__load-grid">
+          {getServiceLoadMetrics(service.load).map((metric) => (
+            <div
+              key={metric.label}
+              className={`load-metric ${metric.unavailable ? 'is-unavailable' : ''}`}
+              title={metric.title}
+            >
+              <span className="load-metric__label">{metric.label}</span>
+              <strong className="load-metric__value">{metric.value}</strong>
+            </div>
+          ))}
+        </div>
+
+        <div className="service-card__meta">
+          <div className="service-card__signals">
+            {getServiceSignals(service, allServices).map((signal) => (
+              <span key={signal} className="signal-chip">
+                {signal}
+              </span>
+            ))}
+          </div>
+
+          <div className="service-card__log-links">
+            <button
+              className="inline-link"
+              disabled={!service.logTargets.some((target) => target.kind === 'stderr') || busy}
+              onClick={(event) => {
+                event.stopPropagation()
+                void onLog(service.label, 'stderr')
+              }}
+            >
+              err
+            </button>
+            <button
+              className="inline-link"
+              disabled={!service.logTargets.some((target) => target.kind === 'stdout') || busy}
+              onClick={(event) => {
+                event.stopPropagation()
+                void onLog(service.label, 'stdout')
+              }}
+            >
+              output
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="service-card__actions">
+        <button
+          aria-label={service.running ? 'Stop service' : 'Start service'}
+          className="action-button primary"
+          disabled={busy}
+          onClick={(event) => {
+            event.stopPropagation()
+            void onAction(service.label, service.running ? 'stop' : 'start')
+          }}
+          title={service.running ? 'Stop service' : 'Start service'}
+        >
+          <span className="button-icon">
+            {service.running ? <Square /> : <Play />}
+          </span>
+          <span className="button-label">{service.running ? 'Stop' : 'Start'}</span>
+        </button>
+        <button
+          aria-label="Restart service"
+          className="action-button"
+          disabled={busy}
+          onClick={(event) => {
+            event.stopPropagation()
+            void onAction(service.label, 'restart')
+          }}
+          title="Restart service"
+        >
+          <span className="button-icon">
+            <RotateCw />
+          </span>
+          <span className="button-label">Restart</span>
+        </button>
+        <button
+          aria-label={service.enabled ? 'Disable service' : 'Enable service'}
+          className="action-button"
+          disabled={busy}
+          onClick={(event) => {
+            event.stopPropagation()
+            void onAction(service.label, service.enabled ? 'disable' : 'enable')
+          }}
+          title={service.enabled ? 'Disable service' : 'Enable service'}
+        >
+          <span className="button-icon">
+            <Power />
+          </span>
+          <span className="button-label">{service.enabled ? 'Disable' : 'Enable'}</span>
+        </button>
+        <button
+          aria-label="Delete service"
+          className="action-button danger"
+          disabled={busy}
+          onClick={(event) => {
+            event.stopPropagation()
+            void onAction(service.label, 'delete')
+          }}
+          title="Delete service"
+        >
+          <span className="button-icon">
+            <Trash2 />
+          </span>
+          <span className="button-label">Delete</span>
+        </button>
+      </div>
+
+      <footer className="service-card__footer">
+        <div aria-live="polite" className={`service-card__feedback is-${feedback.tone}`}>
+          {feedback.message}
+        </div>
+        <span className={`service-card__feedback-badge is-${feedback.tone}`}>
+          {getFeedbackBadgeLabel(feedback.tone)}
+        </span>
+      </footer>
+    </article>
+  )
+}
+
+function LogPanel({
+  busy,
+  onAction,
+  onLog,
+  onOpenTerminal,
+  panel,
+  service
+}: {
+  busy: boolean
+  onAction: (label: string, action: LaunchdAction) => Promise<void>
+  onLog: (label: string, kind: LogKind) => Promise<void>
+  onOpenTerminal: () => void
+  panel: LogPanelState
+  service: LaunchdService | null
+}): JSX.Element {
+  const alternateLogKind = getAlternateLogKind(service, panel.kind)
+  const failure = panel.failure
+
+  return (
+    <article className="log-panel">
+      <header className="log-panel__header">
+        <div>
+          <p className="eyebrow">Tail view</p>
+          <h3>{getLogButtonLabel(panel.kind)}</h3>
+          <p className="log-panel__subtitle">{panel.title}</p>
+        </div>
+
+        <div className="log-panel__meta">
+          <span>{panel.subtitle}</span>
+          <span>{`tail -n 300`}</span>
+          <span>{`Refreshed ${formatGeneratedAt(panel.generatedAt)}`}</span>
+          {service ? <span>{service.label}</span> : null}
+        </div>
+      </header>
+
+      {failure && service ? (
+        <section className="log-triage">
+          <div className="log-triage__intro">
+            <div>
+              <p className="eyebrow">Launch failed</p>
+              <h4>
+                {getActionLabel(failure.action)} needs follow-up
+              </h4>
+              <p className="log-triage__message">{failure.message}</p>
+            </div>
+            <div className="log-triage__actions">
+              {alternateLogKind ? (
+                <button
+                  className="ghost-button toolbar-button"
+                  disabled={busy}
+                  onClick={() => void onLog(service.label, alternateLogKind)}
+                  type="button"
+                >
+                  <span className="button-icon">
+                    <FileText />
+                  </span>
+                  <span className="button-label">{`Show ${getLogButtonLabel(alternateLogKind)}`}</span>
+                </button>
+              ) : null}
+              <button
+                className="ghost-button toolbar-button"
+                disabled={busy}
+                onClick={onOpenTerminal}
+                type="button"
+              >
+                <span className="button-icon">
+                  <Terminal />
+                </span>
+                <span className="button-label">Open terminal</span>
+              </button>
+              <button
+                className="ghost-button toolbar-button"
+                disabled={busy}
+                onClick={() => void onAction(service.label, failure.action)}
+                type="button"
+              >
+                <span className="button-icon">
+                  <RotateCw />
+                </span>
+                <span className="button-label">{`Retry ${getActionLabel(failure.action).toLowerCase()}`}</span>
+              </button>
+            </div>
+          </div>
+
+          <p className="log-triage__summary">{getServiceStateSummary(service)}</p>
+
+          <div className="log-triage__hints">
+            {failure.hints.map((hint) => (
+              <article key={hint.title} className="log-triage__hint">
+                <strong>{hint.title}</strong>
+                <p>{hint.detail}</p>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      <pre className="log-panel__output">{panel.content}</pre>
+    </article>
+  )
+}
+
+function TerminalPanel({
+  panel,
+  service,
+  onBack
+}: {
+  panel: TerminalPanelState
+  service: LaunchdService | null
+  onBack: () => void
+}): JSX.Element {
+  const terminalHostRef = useRef<HTMLDivElement | null>(null)
+  const [exitState, setExitState] = useState<TerminalExitEvent | null>(null)
+
+  useEffect(() => {
+    const host = terminalHostRef.current
+
+    if (!host) {
+      return
+    }
+
+    setExitState(null)
+    const term = new XTerm({
+      allowTransparency: true,
+      convertEol: true,
+      cursorBlink: true,
+      cursorInactiveStyle: 'none',
+      fontFamily: '"SFMono-Regular", "SF Mono", Menlo, Monaco, Consolas, monospace',
+      fontSize: 13,
+      lineHeight: 1.35,
+      scrollback: 4000,
+      theme: {
+        background: '#1f1814',
+        foreground: '#f6eedf',
+        black: '#1f1814',
+        red: '#cb6b62',
+        green: '#7ebc81',
+        yellow: '#d8b869',
+        blue: '#7ea7d8',
+        magenta: '#b38ed6',
+        cyan: '#75bdb7',
+        white: '#f6eedf',
+        brightBlack: '#7f7068',
+        brightRed: '#ef8b82',
+        brightGreen: '#9cd79f',
+        brightYellow: '#f0d286',
+        brightBlue: '#9fc2ee',
+        brightMagenta: '#cfacf3',
+        brightCyan: '#96d9d3',
+        brightWhite: '#fff9ed',
+        cursor: '#e68252',
+        selectionBackground: 'rgba(230, 130, 82, 0.28)'
+      }
+    })
+    const fitAddon = new FitAddon()
+    const terminalInput = term.onData((data) => {
+      window.launchdControl.writeTerminal(panel.session.id, data)
+    })
+    const unsubscribeData = window.launchdControl.onTerminalData((event) => {
+      if (event.id !== panel.session.id) {
+        return
+      }
+
+      term.write(event.data)
+    })
+    const unsubscribeExit = window.launchdControl.onTerminalExit((event) => {
+      if (event.id !== panel.session.id) {
+        return
+      }
+
+      setExitState(event)
+      term.write(
+        `\r\n\x1b[33m[terminal exited with code ${event.exitCode}${
+          typeof event.signal === 'number' ? `, signal ${event.signal}` : ''
+        }]\x1b[0m\r\n`
+      )
+    })
+    const resizeObserver = new ResizeObserver(() => {
+      fitAddon.fit()
+      window.launchdControl.resizeTerminal(panel.session.id, term.cols, term.rows)
+    })
+
+    term.loadAddon(fitAddon)
+    term.open(host)
+    fitAddon.fit()
+    term.focus()
+    window.launchdControl.resizeTerminal(panel.session.id, term.cols, term.rows)
+    resizeObserver.observe(host)
+
+    return () => {
+      resizeObserver.disconnect()
+      unsubscribeExit()
+      unsubscribeData()
+      terminalInput.dispose()
+      term.dispose()
+    }
+  }, [panel.session.id])
+
+  return (
+    <article className="terminal-panel">
+      <header className="terminal-panel__header">
+        <div>
+          <p className="eyebrow">Embedded PTY</p>
+          <h3>{getTerminalHeading(panel.terminalMode)}</h3>
+          <p className="terminal-panel__subtitle">
+            {service ? service.name : panel.session.title}
+          </p>
+        </div>
+
+        <div className="terminal-panel__meta">
+          <span>{panel.session.cwd}</span>
+          <span>{panel.session.shell}</span>
+          <span>{getTerminalSummary(panel.terminalMode)}</span>
+          {service ? <span>{service.label}</span> : null}
+        </div>
+      </header>
+
+      <div className="terminal-panel__toolbar">
+        <p>
+          {panel.terminalMode === 'logs'
+            ? 'This starts with the tail command from the selected service. Press Ctrl+C to stop tailing and keep the shell.'
+            : 'This starts in an interactive shell after printing launchctl context for the selected service.'}
+        </p>
+        <div className="terminal-panel__toolbar-actions">
+          {exitState ? (
+            <span className="terminal-panel__status">
+              Exit {exitState.exitCode}
+              {typeof exitState.signal === 'number' ? ` · signal ${exitState.signal}` : ''}
+            </span>
+          ) : (
+            <span className="terminal-panel__status is-live">Live session</span>
+          )}
+          <button className="ghost-button toolbar-button topbar-button" onClick={onBack} type="button">
+            <span className="button-icon">
+              <ArrowLeft />
+            </span>
+            <span className="button-label">Back to services</span>
+          </button>
+        </div>
+      </div>
+
+      <div className="terminal-panel__viewport">
+        <div className="terminal-panel__host" ref={terminalHostRef} />
+      </div>
+    </article>
+  )
+}

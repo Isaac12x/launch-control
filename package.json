@@ -1,0 +1,76 @@
+{
+  "name": "launchd-control",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron control surface for user launchd services",
+  "main": "./out/main/index.js",
+  "author": "OpenAI Codex",
+  "scripts": {
+    "dev": "npm run prepare:ghostty && electron-vite dev",
+    "build": "npm run prepare:ghostty && electron-vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "dist": "npm run build && electron-builder",
+    "prepare:ghostty": "node scripts/prepare-ghostty.mjs",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "dependencies": {
+    "@fontsource/newsreader": "^5.1.1",
+    "@fontsource/space-grotesk": "^5.1.1",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "lucide-react": "^1.8.0",
+    "node-pty": "^1.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@swc/core": "^1.11.24",
+    "@types/node": "^22.15.0",
+    "@types/react": "^18.3.20",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.4.1",
+    "electron": "^35.1.5",
+    "electron-builder": "^26.0.12",
+    "electron-vite": "^3.1.0",
+    "typescript": "^5.8.3",
+    "vite": "^5.4.18"
+  },
+  "build": {
+    "appId": "ai.openclaw.launchcontrol",
+    "productName": "LaunchControl",
+    "electronDist": "node_modules/electron/dist",
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "buildResources": "assets",
+      "output": "release"
+    },
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/node-pty/**/*"
+    ],
+    "mac": {
+      "icon": "assets/icon.icns",
+      "category": "public.app-category.utilities",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "dmg": {
+      "icon": "assets/icon.icns"
+    },
+    "extraResources": [
+      {
+        "from": "vendor/Ghostty.zip",
+        "to": "Ghostty.zip",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ]
+  }
+}
