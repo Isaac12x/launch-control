@@ -75,6 +75,11 @@ export interface LaunchdPlistDocument {
   generatedAt: string
 }
 
+export interface CreateLaunchdServiceInput {
+  label: string
+  plistContent: string
+}
+
 export interface ServiceStartCondition {
   afterLabel: string
   waitFor: StartConditionState
@@ -107,6 +112,7 @@ export interface LaunchdService {
   label: string
   name: string
   alias: string | null
+  folder: string | null
   plistPath: string | null
   plistName: string | null
   serviceInfo: string | null
@@ -123,6 +129,8 @@ export interface LaunchdService {
 
 export interface LaunchdApi {
   listServices: () => Promise<LaunchdService[]>
+  refreshLiveServices: () => Promise<LaunchdService[]>
+  createService: (input: CreateLaunchdServiceInput) => Promise<LaunchdService[]>
   renameService: (label: string, alias: string) => Promise<LaunchdService[]>
   clearAlias: (label: string) => Promise<LaunchdService[]>
   moveServicesToFolder: (labels: string[], folderPath: string) => Promise<LaunchdService[]>

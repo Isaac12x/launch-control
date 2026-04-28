@@ -23,16 +23,6 @@ function getShell(): string {
   return process.env.SHELL?.trim() || '/bin/zsh'
 }
 
-function getSession(id: string): TerminalSession {
-  const session = sessions.get(id)
-
-  if (!session) {
-    throw new Error(`Terminal session not found: ${id}`)
-  }
-
-  return session
-}
-
 export function openTerminalSession(
   window: BrowserWindow,
   service: LaunchdService,
@@ -99,13 +89,26 @@ export function openTerminalSession(
 }
 
 export function writeTerminalInput(id: string, data: string): void {
-  getSession(id).pty.write(data)
+  const session = sessions.get(id)
+
+  if (!session) {
+    return
+  }
+
+  session.pty.write(data)
 }
 
 export function resizeTerminalSession(id: string, cols: number, rows: number): void {
   const nextCols = Math.max(2, Math.floor(cols))
   const nextRows = Math.max(1, Math.floor(rows))
-  getSession(id).pty.resize(nextCols, nextRows)
+  const session = sessions.get(id)
+
+  if (!session) {
+    return
+  }
+
+  // Renderer cleanup can race with PTY shutdown during panel transitions.
+  session.pty.resize(nextCols, nextRows)
 }
 
 export function closeTerminalSession(id: string): void {

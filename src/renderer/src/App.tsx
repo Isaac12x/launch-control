@@ -1,9 +1,22 @@
-import { useDeferredValue, useEffect, useRef, useState } from 'react'
-import type { CSSProperties, KeyboardEvent } from 'react'
+import {
+  memo,
+  startTransition,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore
+} from 'react'
+import type { CSSProperties, DragEvent, KeyboardEvent, MouseEvent } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal as XTerm } from '@xterm/xterm'
 import {
   ArrowLeft,
+  ArrowDownZA,
+  ArrowUpAZ,
+  ArrowDownWideNarrow,
+  ArrowUpWideNarrow,
   Check,
   ChevronRight,
   FileText,
@@ -12,6 +25,7 @@ import {
   ListTree,
   Pencil,
   Play,
+  Plus,
   Power,
   RefreshCcw,
   RotateCw,
@@ -22,6 +36,7 @@ import {
   X
 } from 'lucide-react'
 import type {
+  CreateLaunchdServiceInput,
   LaunchdAction,
   LaunchdPlistDocument,
   LaunchdService,
@@ -37,7 +52,13 @@ import type {
 type LogKind = 'stdout' | 'stderr'
 type CardFeedbackTone = 'neutral' | 'progress' | 'success' | 'error'
 type ServiceViewMode = 'grid' | 'tree'
+type ServiceSortField = 'name' | 'usage'
+type ServiceSortDirection = 'asc' | 'desc'
+type ServiceSortOption = `${ServiceSortField}-${ServiceSortDirection}`
+type SidebarSection = 'overview' | 'services'
 type RecoverableLaunchdAction = Extract<LaunchdAction, 'start' | 'restart'>
+type TreeFolderAction = Extract<LaunchdAction, 'start' | 'stop' | 'restart' | 'enable' | 'disable'>
+type ServiceLoadResolver = (service: LaunchdService) => ServiceLoadSnapshot
 
 interface CardFeedback {
   tone: CardFeedbackTone
@@ -81,7 +102,11 @@ interface TerminalPanelState {
   terminalMode: LaunchdTerminalMode
 }
 
-type ContentPanelState = { mode: 'services' } | LogPanelState | TerminalPanelState
+type ContentPanelState =
+  | { mode: 'services' }
+  | { mode: 'create' }
+  | LogPanelState
+  | TerminalPanelState
 type ServiceTreeNode = ServiceTreeFolder | ServiceTreeLeaf
 
 interface ServiceTreeFolder {
@@ -108,8 +133,28 @@ interface LaunchdPlistSnippet {
   insertText?: string
 }
 
+interface TreeFolderContextMenuState {
+  path: string
+  name: string
+  labels: string[]
+  left: number
+  top: number
+}
+
 const servicesPanel: ContentPanelState = { mode: 'services' }
+const createServicePanel: ContentPanelState = { mode: 'create' }
 const timePattern = /^([01]\d|2[0-3]):([0-5]\d)$/
+const liveRefreshIntervalMs = 1000
+const treeServiceLabelsMimeType = 'application/x-launchcontrol-service-labels'
+const serviceLabelPattern = /^[A-Za-z0-9._-]+$/
+const defaultCreateServiceLabel = 'com.example.agent'
+const treeFolderMenuActions: TreeFolderAction[] = [
+  'start',
+  'stop',
+  'restart',
+  'enable',
+  'disable'
+]
 const launchdPlistLibrary: LaunchdPlistSnippet[] = [
   {
     key: 'label',
@@ -391,13 +436,127 @@ async function copyTextToClipboard(value: string): Promise<void> {
   helper.remove()
 }
 
-function sortServices(services: LaunchdService[]): LaunchdService[] {
-  return [...services].sort((left, right) => {
-    if (left.running !== right.running) {
-      return left.running ? -1 : 1
-    }
+function normalizeServiceLabelInput(value: string): string {
+  return value.trim()
+}
 
-    return left.name.localeCompare(right.name)
+function buildLaunchAgentPath(label: string): string {
+  return `~/Library/LaunchAgents/${label}.plist`
+}
+
+function buildNewServiceTemplate(label: string): string {
+  const normalizedLabel = normalizeServiceLabelInput(label) || defaultCreateServiceLabel
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${normalizedLabel}</string>
+
+  <!-- Replace this command before starting the service. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>echo "Replace ProgramArguments for ${normalizedLabel} before enabling this service."</string>
+  </array>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/${normalizedLabel}.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/${normalizedLabel}.err.log</string>
+</dict>
+</plist>`
+}
+
+function getServiceSortField(sortOption: ServiceSortOption): ServiceSortField {
+  return sortOption.startsWith('usage-') ? 'usage' : 'name'
+}
+
+function getServiceSortDirection(sortOption: ServiceSortOption): ServiceSortDirection {
+  return sortOption.endsWith('-desc') ? 'desc' : 'asc'
+}
+
+function toggleServiceSort(
+  currentSort: ServiceSortOption,
+  field: ServiceSortField
+): ServiceSortOption {
+  if (getServiceSortField(currentSort) !== field) {
+    return `${field}-asc`
+  }
+
+  return `${field}-${getServiceSortDirection(currentSort) === 'asc' ? 'desc' : 'asc'}`
+}
+
+function compareNullableNumbers(
+  left: number | null,
+  right: number | null,
+  direction: ServiceSortDirection
+): number {
+  if (left === null && right === null) {
+    return 0
+  }
+
+  if (left === null) {
+    return 1
+  }
+
+  if (right === null) {
+    return -1
+  }
+
+  return direction === 'asc' ? right - left : left - right
+}
+
+function compareServiceUsage(
+  left: LaunchdService,
+  right: LaunchdService,
+  direction: ServiceSortDirection,
+  resolveLoad: ServiceLoadResolver = (service) => service.load
+): number {
+  if (left.running !== right.running) {
+    return left.running ? -1 : 1
+  }
+
+  const leftLoad = resolveLoad(left)
+  const rightLoad = resolveLoad(right)
+  const comparisons = [
+    compareNullableNumbers(leftLoad.cpuPercent, rightLoad.cpuPercent, direction),
+    compareNullableNumbers(leftLoad.gpuPercent, rightLoad.gpuPercent, direction),
+    compareNullableNumbers(leftLoad.residentMemoryBytes, rightLoad.residentMemoryBytes, direction),
+    compareNullableNumbers(leftLoad.vramBytes, rightLoad.vramBytes, direction),
+    compareNullableNumbers(leftLoad.memoryPercent, rightLoad.memoryPercent, direction),
+    compareNullableNumbers(leftLoad.energyImpact, rightLoad.energyImpact, direction)
+  ]
+
+  for (const comparison of comparisons) {
+    if (comparison !== 0) {
+      return comparison
+    }
+  }
+
+  return left.name.localeCompare(right.name) || left.label.localeCompare(right.label)
+}
+
+function sortServices(
+  services: LaunchdService[],
+  sortOption: ServiceSortOption,
+  resolveLoad?: ServiceLoadResolver
+): LaunchdService[] {
+  return [...services].sort((left, right) => {
+    switch (sortOption) {
+      case 'name-desc':
+        return right.name.localeCompare(left.name) || right.label.localeCompare(left.label)
+      case 'usage-desc':
+        return compareServiceUsage(left, right, 'desc', resolveLoad)
+      case 'usage-asc':
+        return compareServiceUsage(left, right, 'asc', resolveLoad)
+      case 'name-asc':
+      default:
+        return left.name.localeCompare(right.name) || left.label.localeCompare(right.label)
+    }
   })
 }
 
@@ -477,6 +636,10 @@ function getActionDone(action: LaunchdAction): string {
       return exhaustiveAction
     }
   }
+}
+
+function getTreeFolderActionLabel(action: TreeFolderAction): string {
+  return action === 'start' ? 'Run all' : `${getActionLabel(action)} all`
 }
 
 function getLogButtonLabel(kind: LogKind): string {
@@ -703,7 +866,7 @@ function formatBytes(value: number | null): string {
 
 function getServiceLoadMetrics(load: ServiceLoadSnapshot): ServiceLoadMetricDisplay[] {
   const unavailableReason =
-    'Per-process GPU and VRAM metrics are unavailable without privileged macOS sampling.'
+    'Reliable per-process GPU and VRAM metrics require privileged macOS samplers that this app cannot access.'
 
   return [
     {
@@ -741,6 +904,122 @@ function getServiceLoadMetrics(load: ServiceLoadSnapshot): ServiceLoadMetricDisp
   ]
 }
 
+type ServiceUsageListener = () => void
+
+const serviceUsageListenersByLabel = new Map<string, Set<ServiceUsageListener>>()
+let serviceUsageSnapshotsByLabel: Record<string, ServiceLoadSnapshot> = {}
+
+function hasServiceUsageDisplayChanged(
+  currentLoad: ServiceLoadSnapshot,
+  nextLoad: ServiceLoadSnapshot
+): boolean {
+  return (
+    currentLoad.cpuPercent !== nextLoad.cpuPercent ||
+    currentLoad.gpuPercent !== nextLoad.gpuPercent ||
+    currentLoad.residentMemoryBytes !== nextLoad.residentMemoryBytes ||
+    currentLoad.vramBytes !== nextLoad.vramBytes ||
+    currentLoad.memoryPercent !== nextLoad.memoryPercent ||
+    currentLoad.energyImpact !== nextLoad.energyImpact
+  )
+}
+
+function getStoredServiceUsageSnapshot(label: string): ServiceLoadSnapshot | null {
+  return serviceUsageSnapshotsByLabel[label] ?? null
+}
+
+function getServiceLoadForSort(service: LaunchdService): ServiceLoadSnapshot {
+  return getStoredServiceUsageSnapshot(service.label) ?? service.load
+}
+
+function subscribeServiceUsageSnapshot(
+  label: string,
+  listener: ServiceUsageListener
+): () => void {
+  const listeners = serviceUsageListenersByLabel.get(label) ?? new Set<ServiceUsageListener>()
+
+  listeners.add(listener)
+  serviceUsageListenersByLabel.set(label, listeners)
+
+  return () => {
+    listeners.delete(listener)
+
+    if (listeners.size === 0) {
+      serviceUsageListenersByLabel.delete(label)
+    }
+  }
+}
+
+function notifyServiceUsageSnapshot(label: string): void {
+  const listeners = serviceUsageListenersByLabel.get(label)
+
+  if (!listeners) {
+    return
+  }
+
+  for (const listener of listeners) {
+    listener()
+  }
+}
+
+function updateServiceUsageSnapshots(
+  services: LaunchdService[],
+  options: { prune?: boolean } = {}
+): void {
+  const nextSnapshotsByLabel = options.prune ? {} : { ...serviceUsageSnapshotsByLabel }
+  const changedLabels = new Set<string>()
+  const nextLabels = new Set<string>()
+
+  for (const service of services) {
+    nextLabels.add(service.label)
+
+    const currentLoad = serviceUsageSnapshotsByLabel[service.label]
+
+    if (!currentLoad || hasServiceUsageDisplayChanged(currentLoad, service.load)) {
+      nextSnapshotsByLabel[service.label] = service.load
+      changedLabels.add(service.label)
+      continue
+    }
+
+    nextSnapshotsByLabel[service.label] = currentLoad
+  }
+
+  if (options.prune) {
+    for (const label of Object.keys(serviceUsageSnapshotsByLabel)) {
+      if (!nextLabels.has(label)) {
+        changedLabels.add(label)
+      }
+    }
+  }
+
+  if (changedLabels.size === 0) {
+    return
+  }
+
+  serviceUsageSnapshotsByLabel = nextSnapshotsByLabel
+
+  for (const label of changedLabels) {
+    notifyServiceUsageSnapshot(label)
+  }
+}
+
+function scheduleBackgroundServiceUsageUpdate(services: LaunchdService[]): void {
+  window.setTimeout(() => {
+    startTransition(() => {
+      updateServiceUsageSnapshots(services)
+    })
+  }, 0)
+}
+
+function useServiceUsageSnapshot(label: string): ServiceLoadSnapshot | null {
+  const subscribe = useCallback(
+    (listener: ServiceUsageListener) => subscribeServiceUsageSnapshot(label, listener),
+    [label]
+  )
+  const getSnapshot = useCallback(() => getStoredServiceUsageSnapshot(label), [label])
+
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+}
+
 function getAdaptiveTitleSize(name: string): string {
   if (name.length > 54) {
     return '1rem'
@@ -771,6 +1050,7 @@ function matchesServiceQuery(service: LaunchdService, query: string): boolean {
   return [
     service.name,
     service.alias ?? '',
+    service.folder ?? '',
     service.label,
     service.plistName ?? '',
     service.serviceInfo ?? '',
@@ -948,38 +1228,39 @@ function getPreferredFailureLogKind(service: LaunchdService, logs: ServiceLogs):
   return 'stdout'
 }
 
-function normalizeServiceNameInput(value: string): string {
+function normalizeFolderPathInput(value: string): string {
   return value
     .split('/')
-    .map((segment) => segment.trim())
-    .filter(Boolean)
+    .flatMap((segment) => {
+      const trimmedSegment = segment.trim()
+      return trimmedSegment ? [trimmedSegment] : []
+    })
     .join('/')
 }
 
-function getServiceLeafName(service: LaunchdService): string {
-  const segments = getServiceTreeSegments(service)
-  return segments[segments.length - 1] ?? service.name
+function normalizeServiceTitleInput(value: string): string {
+  return value.trim()
 }
 
-function resolveServiceAliasInput(service: LaunchdService, value: string): string {
-  const normalizedValue = normalizeServiceNameInput(value)
+function getServiceLeafName(service: LaunchdService): string {
+  return service.name
+}
+
+function resolveServiceAliasInput(value: string): string {
+  const normalizedValue = normalizeServiceTitleInput(value)
 
   if (!normalizedValue) {
     return ''
-  }
-
-  if (/\/\s*$/.test(value.trim())) {
-    return `${normalizedValue}/${getServiceLeafName(service)}`
   }
 
   return normalizedValue
 }
 
 function getServiceTreeSegments(service: LaunchdService): string[] {
-  const aliasPath = normalizeServiceNameInput(service.alias ?? '')
+  const folderPath = normalizeFolderPathInput(service.folder ?? '')
 
-  if (aliasPath) {
-    return aliasPath.split('/')
+  if (folderPath) {
+    return [...folderPath.split('/'), getServiceLeafName(service)]
   }
 
   return [service.name]
@@ -999,6 +1280,40 @@ function handleTreeRowKeyDown(
 
   event.preventDefault()
   callback()
+}
+
+function normalizeTreeDragLabels(labels: unknown): string[] {
+  if (!Array.isArray(labels)) {
+    return []
+  }
+
+  const uniqueLabels = new Set<string>()
+
+  for (const label of labels) {
+    if (typeof label === 'string' && label.length > 0) {
+      uniqueLabels.add(label)
+    }
+  }
+
+  return [...uniqueLabels]
+}
+
+function getTreeDragTransferLabels(dataTransfer: DataTransfer): string[] {
+  const encodedLabels = dataTransfer.getData(treeServiceLabelsMimeType)
+
+  if (encodedLabels) {
+    try {
+      const labels = normalizeTreeDragLabels(JSON.parse(encodedLabels))
+
+      if (labels.length > 0) {
+        return labels
+      }
+    } catch {
+      return []
+    }
+  }
+
+  return normalizeTreeDragLabels(dataTransfer.getData('text/plain').split('\n'))
 }
 
 function buildServiceTree(services: LaunchdService[]): ServiceTreeNode[] {
@@ -1091,15 +1406,94 @@ function collectExpandedFolderPaths(nodes: ServiceTreeNode[]): string[] {
   return folderPaths
 }
 
+function collectFolderServiceLabels(folder: ServiceTreeFolder): string[] {
+  const labels: string[] = []
+
+  for (const child of folder.children) {
+    if (child.type === 'folder') {
+      labels.push(...collectFolderServiceLabels(child))
+      continue
+    }
+
+    labels.push(child.service.label)
+  }
+
+  return labels
+}
+
+function canRunTreeFolderAction(service: LaunchdService, action: TreeFolderAction): boolean {
+  switch (action) {
+    case 'start':
+      return service.enabled && !service.running
+    case 'stop':
+      return service.loaded || service.running
+    case 'restart':
+      return service.enabled && (service.loaded || service.running)
+    case 'enable':
+      return !service.enabled
+    case 'disable':
+      return service.enabled
+    default: {
+      const exhaustiveAction: never = action
+      return exhaustiveAction
+    }
+  }
+}
+
+function getTreeFolderActionMessage(action: TreeFolderAction, folderPath: string): string {
+  switch (action) {
+    case 'start':
+      return `Everything in ${folderPath} is already running or disabled.`
+    case 'stop':
+      return `Nothing in ${folderPath} is loaded right now.`
+    case 'restart':
+      return `Nothing in ${folderPath} is running right now.`
+    case 'enable':
+      return `Everything in ${folderPath} is already enabled.`
+    case 'disable':
+      return `Everything in ${folderPath} is already disabled.`
+    default: {
+      const exhaustiveAction: never = action
+      return exhaustiveAction
+    }
+  }
+}
+
+function formatServiceCount(count: number): string {
+  return `${count} service${count === 1 ? '' : 's'}`
+}
+
+function getTreeFolderMenuPosition(clientX: number, clientY: number): {
+  left: number
+  top: number
+} {
+  const padding = 12
+  const menuWidth = 240
+  const menuHeight = 320
+
+  return {
+    left: Math.max(padding, Math.min(clientX, window.innerWidth - menuWidth - padding)),
+    top: Math.max(padding, Math.min(clientY, window.innerHeight - menuHeight - padding))
+  }
+}
+
 export default function App(): JSX.Element {
   const [services, setServices] = useState<LaunchdService[]>([])
+  const [serviceSort, setServiceSort] = useState<ServiceSortOption>('name-asc')
   const [selectedLabel, setSelectedLabel] = useState<string | null>(null)
   const [selectedTreeLabels, setSelectedTreeLabels] = useState<string[]>([])
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [sidebarSection, setSidebarSection] = useState<SidebarSection>('overview')
   const [treeSelectionBusy, setTreeSelectionBusy] = useState(false)
+  const [treeFolderActionBusy, setTreeFolderActionBusy] = useState<TreeFolderAction | null>(null)
+  const [treeDraggedLabels, setTreeDraggedLabels] = useState<string[]>([])
+  const [treeDropTargetPath, setTreeDropTargetPath] = useState<string | null>(null)
+  const [treeFolderMenu, setTreeFolderMenu] = useState<TreeFolderContextMenuState | null>(null)
   const [contentPanel, setContentPanel] = useState<ContentPanelState>(servicesPanel)
   const [cardFeedbacks, setCardFeedbacks] = useState<Record<string, CardFeedback>>({})
   const [actionFailures, setActionFailures] = useState<Record<string, ServiceActionFailure>>({})
   const [loading, setLoading] = useState(true)
+  const [createServiceBusy, setCreateServiceBusy] = useState(false)
   const [busyLabel, setBusyLabel] = useState<string | null>(null)
   const [pageError, setPageError] = useState<string | null>(null)
   const [openAtLogin, setOpenAtLogin] = useState(false)
@@ -1110,10 +1504,19 @@ export default function App(): JSX.Element {
   const [treeFolderDraft, setTreeFolderDraft] = useState('')
   const [treeFolderMessage, setTreeFolderMessage] = useState<string | null>(null)
   const treeFolderInputRef = useRef<HTMLInputElement | null>(null)
+  const treeFolderMenuRef = useRef<HTMLDivElement | null>(null)
+  const liveRefreshBusyRef = useRef(false)
+  const serviceSortRef = useRef<ServiceSortOption>(serviceSort)
   const deferredSearchQuery = useDeferredValue(searchQuery)
   const filteredServices = services.filter((service) =>
     matchesServiceQuery(service, deferredSearchQuery)
   )
+  const treeBusy = treeSelectionBusy || treeFolderActionBusy !== null
+  const liveRefreshPaused =
+    loading || createServiceBusy || busyLabel !== null || treeBusy || loginItemBusy
+  const liveRefreshPausedRef = useRef(liveRefreshPaused)
+  const serviceSortField = getServiceSortField(serviceSort)
+  const serviceSortDirection = getServiceSortDirection(serviceSort)
 
   const selectedService =
     filteredServices.find((service) => service.label === selectedLabel) ?? filteredServices[0] ?? null
@@ -1124,7 +1527,9 @@ export default function App(): JSX.Element {
   const terminalService =
     contentPanel.mode === 'log' || contentPanel.mode === 'terminal'
       ? services.find((service) => service.label === contentPanel.serviceLabel) ?? null
-      : selectedService
+      : contentPanel.mode === 'services'
+        ? selectedService
+        : null
   const terminalMode: LaunchdTerminalMode =
     contentPanel.mode === 'log'
       ? 'logs'
@@ -1142,6 +1547,52 @@ export default function App(): JSX.Element {
     enabled: countBy(services, (service) => service.enabled)
   }
 
+  function sortWithCurrentPreference(nextServices: LaunchdService[]): LaunchdService[] {
+    updateServiceUsageSnapshots(nextServices, { prune: true })
+    return sortServices(nextServices, serviceSortRef.current, getServiceLoadForSort)
+  }
+
+  function handleServiceSortToggle(field: ServiceSortField): void {
+    const nextSort = toggleServiceSort(serviceSortRef.current, field)
+    serviceSortRef.current = nextSort
+    setServiceSort(nextSort)
+  }
+
+  function applyServiceSnapshot(
+    nextServices: LaunchdService[],
+    options: {
+      transition?: boolean
+    } = {}
+  ): void {
+    const sortedServices = sortWithCurrentPreference(nextServices)
+    const apply = (): void => {
+      setServices(sortedServices)
+      setCardFeedbacks((current) => pruneCardFeedbacks(current, sortedServices))
+      setActionFailures((current) => pruneActionFailures(current, sortedServices))
+      setSelectedLabel((currentLabel) => getSelectedLabel(sortedServices, currentLabel))
+      setContentPanel((current) => {
+        if (sortedServices.length === 0) {
+          return servicesPanel
+        }
+
+        if (current.mode === 'log' || current.mode === 'terminal') {
+          return sortedServices.some((service) => service.label === current.serviceLabel)
+            ? current
+            : servicesPanel
+        }
+
+        return current
+      })
+    }
+
+    if (options.transition) {
+      startTransition(apply)
+      return
+    }
+
+    apply()
+  }
+
   function setCardFeedback(label: string, feedback: CardFeedback): void {
     setCardFeedbacks((current) => ({ ...current, [label]: feedback }))
   }
@@ -1150,33 +1601,38 @@ export default function App(): JSX.Element {
     setSelectedLabel(label)
   }
 
+  function focusServiceFromSidebar(label: string): void {
+    setSelectedLabel(label)
+    setContentPanel(servicesPanel)
+    setServiceViewMode('tree')
+  }
+
   async function loadServices(): Promise<void> {
     setLoading(true)
     setPageError(null)
 
     try {
-      const nextServices = sortServices(await window.launchdControl.listServices())
-      setServices(nextServices)
-      setCardFeedbacks((current) => pruneCardFeedbacks(current, nextServices))
-      setActionFailures((current) => pruneActionFailures(current, nextServices))
-      setSelectedLabel((currentLabel) => getSelectedLabel(nextServices, currentLabel))
-      setContentPanel((current) => {
-        if (nextServices.length === 0) {
-          return servicesPanel
-        }
-
-        if (current.mode === 'log' || current.mode === 'terminal') {
-          return nextServices.some((service) => service.label === current.serviceLabel)
-            ? current
-            : servicesPanel
-        }
-
-        return current
-      })
+      applyServiceSnapshot(await window.launchdControl.listServices())
     } catch (loadError) {
       setPageError(loadError instanceof Error ? loadError.message : String(loadError))
     } finally {
       setLoading(false)
+    }
+  }
+
+  async function refreshLiveServiceUsage(): Promise<void> {
+    if (liveRefreshBusyRef.current || liveRefreshPausedRef.current) {
+      return
+    }
+
+    liveRefreshBusyRef.current = true
+
+    try {
+      scheduleBackgroundServiceUsageUpdate(await window.launchdControl.refreshLiveServices())
+    } catch {
+      // Silent live refresh failures should not replace the current UI state.
+    } finally {
+      liveRefreshBusyRef.current = false
     }
   }
 
@@ -1189,9 +1645,74 @@ export default function App(): JSX.Element {
     }
   }
 
+  function openCreateService(): void {
+    setPageError(null)
+    setContentPanel(createServicePanel)
+  }
+
+  async function handleCreateService(input: CreateLaunchdServiceInput): Promise<void> {
+    const label = normalizeServiceLabelInput(input.label)
+
+    setCreateServiceBusy(true)
+    setPageError(null)
+
+    try {
+      const nextServices = sortWithCurrentPreference(await window.launchdControl.createService(input))
+
+      setServices(nextServices)
+      setCardFeedbacks((current) =>
+        pruneCardFeedbacks(
+          {
+            ...current,
+            [label]: {
+              tone: 'success' as const,
+              message: 'Service created. Edit the plist or start it when ready.'
+            }
+          },
+          nextServices
+        )
+      )
+      setActionFailures((current) => pruneActionFailures(current, nextServices))
+      setSelectedLabel(getSelectedLabel(nextServices, label))
+      setSidebarSection('services')
+      setContentPanel(servicesPanel)
+    } catch (createError) {
+      const message = createError instanceof Error ? createError.message : String(createError)
+      setPageError(`Create failed: ${message}`)
+      throw createError
+    } finally {
+      setCreateServiceBusy(false)
+    }
+  }
+
   useEffect(() => {
     void Promise.all([loadServices(), loadLoginItemSettings()])
   }, [])
+
+  useEffect(() => {
+    liveRefreshPausedRef.current = liveRefreshPaused
+  }, [liveRefreshPaused])
+
+  useEffect(() => {
+    serviceSortRef.current = serviceSort
+    startTransition(() => {
+      setServices((current) => sortServices(current, serviceSort, getServiceLoadForSort))
+    })
+  }, [serviceSort])
+
+  useEffect(() => {
+    if (loading) {
+      return
+    }
+
+    void refreshLiveServiceUsage()
+
+    const intervalId = window.setInterval(() => {
+      void refreshLiveServiceUsage()
+    }, liveRefreshIntervalMs)
+
+    return () => window.clearInterval(intervalId)
+  }, [loading, liveRefreshPaused])
 
   useEffect(() => {
     const folderPaths = collectExpandedFolderPaths(buildServiceTree(filteredServices))
@@ -1222,6 +1743,7 @@ export default function App(): JSX.Element {
     }
 
     setSelectedTreeLabels((current) => (current.length === 0 ? current : []))
+    setTreeFolderMenu(null)
   }, [serviceViewMode])
 
   useEffect(() => {
@@ -1268,6 +1790,44 @@ export default function App(): JSX.Element {
     return () => window.removeEventListener('keydown', handleSlashShortcut)
   }, [contentPanel.mode, serviceViewMode])
 
+  useEffect(() => {
+    if (!treeFolderMenu) {
+      return
+    }
+
+    function closeMenuOnOutsidePointer(event: PointerEvent): void {
+      const target = event.target
+
+      if (target instanceof Node && treeFolderMenuRef.current?.contains(target)) {
+        return
+      }
+
+      setTreeFolderMenu(null)
+    }
+
+    function closeMenuOnEscape(event: globalThis.KeyboardEvent): void {
+      if (event.key === 'Escape') {
+        setTreeFolderMenu(null)
+      }
+    }
+
+    function closeMenu(): void {
+      setTreeFolderMenu(null)
+    }
+
+    window.addEventListener('pointerdown', closeMenuOnOutsidePointer)
+    window.addEventListener('keydown', closeMenuOnEscape)
+    window.addEventListener('resize', closeMenu)
+    window.addEventListener('blur', closeMenu)
+
+    return () => {
+      window.removeEventListener('pointerdown', closeMenuOnOutsidePointer)
+      window.removeEventListener('keydown', closeMenuOnEscape)
+      window.removeEventListener('resize', closeMenu)
+      window.removeEventListener('blur', closeMenu)
+    }
+  }, [treeFolderMenu])
+
   function toggleFolder(path: string): void {
     setExpandedFolders((current) => ({
       ...current,
@@ -1286,18 +1846,53 @@ export default function App(): JSX.Element {
     setSelectedTreeLabels([])
   }
 
-  async function moveTreeSelectionToFolder(folderPath: string): Promise<void> {
+  function openTreeFolderMenu(
+    folder: ServiceTreeFolder,
+    clientX: number,
+    clientY: number
+  ): void {
+    if (treeBusy) {
+      return
+    }
+
+    const labels = collectFolderServiceLabels(folder)
+
+    if (labels.length === 0) {
+      return
+    }
+
+    const { left, top } = getTreeFolderMenuPosition(clientX, clientY)
+    setTreeFolderMenu({
+      path: folder.path,
+      name: folder.name,
+      labels,
+      left,
+      top
+    })
+  }
+
+  async function moveTreeLabelsToFolder(
+    labels: string[],
+    folderPath: string,
+    options: {
+      clearSelectionOnSuccess?: boolean
+      toggleFolderWhenEmpty?: boolean
+    } = {}
+  ): Promise<void> {
     if (treeSelectionBusy) {
       return
     }
 
-    const labelsToMove = selectedTreeLabels.filter((label) => {
+    const labelsToMove = [...new Set(labels)].filter((label) => {
       const service = servicesByLabel[label]
       return service ? getServiceFolderPath(service) !== folderPath : false
     })
 
     if (labelsToMove.length === 0) {
-      toggleFolder(folderPath)
+      if (options.toggleFolderWhenEmpty) {
+        toggleFolder(folderPath)
+      }
+
       return
     }
 
@@ -1320,7 +1915,7 @@ export default function App(): JSX.Element {
     }))
 
     try {
-      const nextServices = sortServices(
+      const nextServices = sortWithCurrentPreference(
         await window.launchdControl.moveServicesToFolder(labelsToMove, folderPath)
       )
 
@@ -1345,7 +1940,11 @@ export default function App(): JSX.Element {
       setSelectedLabel((currentLabel) =>
         getSelectedLabel(nextServices, currentLabel ?? labelsToMove[0] ?? null)
       )
-      setSelectedTreeLabels([])
+      setSelectedTreeLabels((current) =>
+        options.clearSelectionOnSuccess
+          ? []
+          : current.filter((label) => !labelsToMove.includes(label))
+      )
     } catch (moveError) {
       const message = moveError instanceof Error ? moveError.message : String(moveError)
 
@@ -1367,12 +1966,37 @@ export default function App(): JSX.Element {
     }
   }
 
+  async function moveTreeSelectionToFolder(folderPath: string): Promise<void> {
+    await moveTreeLabelsToFolder(selectedTreeLabels, folderPath, {
+      clearSelectionOnSuccess: true,
+      toggleFolderWhenEmpty: true
+    })
+  }
+
+  function startTreeServiceDrag(label: string): string[] {
+    const labels = selectedTreeLabels.includes(label) ? selectedTreeLabels : [label]
+    setTreeDraggedLabels(labels)
+    setTreeDropTargetPath(null)
+    return labels
+  }
+
+  function endTreeServiceDrag(): void {
+    setTreeDraggedLabels([])
+    setTreeDropTargetPath(null)
+  }
+
+  async function moveTreeDraggedLabelsToFolder(labels: string[], folderPath: string): Promise<void> {
+    setTreeDropTargetPath(null)
+    await moveTreeLabelsToFolder(labels, folderPath)
+    setTreeDraggedLabels([])
+  }
+
   async function createTreeFolderFromSelection(): Promise<void> {
-    if (treeSelectionBusy) {
+    if (treeBusy) {
       return
     }
 
-    const folderPath = normalizeServiceNameInput(treeFolderDraft)
+    const folderPath = normalizeFolderPathInput(treeFolderDraft)
 
     if (!folderPath) {
       setTreeFolderMessage('Type a folder path first, for example homebrew/db.')
@@ -1418,7 +2042,7 @@ export default function App(): JSX.Element {
     }))
 
     try {
-      const nextServices = sortServices(
+      const nextServices = sortWithCurrentPreference(
         await window.launchdControl.moveServicesToFolder(labelsToMove, folderPath)
       )
 
@@ -1483,6 +2107,165 @@ export default function App(): JSX.Element {
     }
   }
 
+  async function handleTreeFolderAction(
+    folderPath: string,
+    folderLabels: string[],
+    action: TreeFolderAction
+  ): Promise<void> {
+    if (treeBusy) {
+      return
+    }
+
+    const actionableLabels = [...new Set(folderLabels)].filter((label) => {
+      const service = servicesByLabel[label]
+      return service ? canRunTreeFolderAction(service, action) : false
+    })
+
+    setTreeFolderMenu(null)
+
+    if (actionableLabels.length === 0) {
+      setTreeFolderMessage(getTreeFolderActionMessage(action, folderPath))
+      return
+    }
+
+    const progressMessage =
+      actionableLabels.length === 1
+        ? `${getActionProgress(action)} ${servicesByLabel[actionableLabels[0]]?.name ?? 'service'}...`
+        : `${getActionProgress(action)} ${actionableLabels.length} services in ${folderPath}...`
+
+    setPageError(null)
+    setTreeFolderMessage(progressMessage)
+    setTreeFolderActionBusy(action)
+    setCardFeedbacks((current) => ({
+      ...current,
+      ...Object.fromEntries(
+        actionableLabels.map((label) => [
+          label,
+          {
+            tone: 'progress' as const,
+            message: progressMessage
+          }
+        ])
+      )
+    }))
+
+    let nextServices = services
+    const failedLabels = new Set<string>()
+    const failures: Array<{
+      label: string
+      name: string
+      message: string
+      failure: ServiceActionFailure | null
+    }> = []
+
+    try {
+      for (const label of actionableLabels) {
+        const currentService =
+          nextServices.find((service) => service.label === label) ?? servicesByLabel[label] ?? null
+
+        if (!currentService) {
+          failedLabels.add(label)
+          failures.push({
+            label,
+            name: label,
+            message: 'Service no longer exists.',
+            failure: null
+          })
+          continue
+        }
+
+        try {
+          nextServices = sortWithCurrentPreference(await window.launchdControl.runAction(label, action))
+        } catch (actionError) {
+          const message = actionError instanceof Error ? actionError.message : String(actionError)
+          failedLabels.add(label)
+          failures.push({
+            label,
+            name: currentService.name,
+            message,
+            failure:
+              action === 'start' || action === 'restart'
+                ? buildActionFailure(currentService, action, message)
+                : null
+          })
+        }
+      }
+
+      const succeededLabels = actionableLabels.filter((label) => !failedLabels.has(label))
+
+      setServices(nextServices)
+      setCardFeedbacks((current) =>
+        pruneCardFeedbacks(
+          {
+            ...current,
+            ...Object.fromEntries(
+              succeededLabels.map((label) => [
+                label,
+                {
+                  tone: 'success' as const,
+                  message: `${getActionDone(action)}.`
+                }
+              ])
+            ),
+            ...Object.fromEntries(
+              failures.map(({ label, message }) => [
+                label,
+                {
+                  tone: 'error' as const,
+                  message: `${getActionLabel(action)} failed: ${message}`
+                }
+              ])
+            )
+          },
+          nextServices
+        )
+      )
+      setActionFailures((current) => {
+        const nextFailures = { ...current }
+
+        for (const label of succeededLabels) {
+          delete nextFailures[label]
+        }
+
+        for (const failure of failures) {
+          if (failure.failure) {
+            nextFailures[failure.label] = failure.failure
+          }
+        }
+
+        return pruneActionFailures(nextFailures, nextServices)
+      })
+      setSelectedLabel((currentLabel) =>
+        getSelectedLabel(nextServices, currentLabel ?? actionableLabels[0] ?? null)
+      )
+
+      if (failures.length === 0) {
+        setTreeFolderMessage(`${getActionDone(action)} ${formatServiceCount(actionableLabels.length)} in ${folderPath}.`)
+        return
+      }
+
+      const succeededCount = actionableLabels.length - failures.length
+      const failureSummary = failures
+        .slice(0, 3)
+        .map((failure) => `${failure.name}: ${failure.message}`)
+        .join(' ')
+      const failureSuffix = failures.length > 3 ? ' More services failed.' : ''
+
+      setTreeFolderMessage(
+        succeededCount > 0
+          ? `${getActionDone(action)} ${formatServiceCount(succeededCount)} in ${folderPath}. ${failures.length} failed.`
+          : `${getActionLabel(action)} failed for every service in ${folderPath}.`
+      )
+      setPageError(
+        `${getActionLabel(action)} finished with ${failures.length} failure${
+          failures.length === 1 ? '' : 's'
+        } in ${folderPath}. ${failureSummary}${failureSuffix}`
+      )
+    } finally {
+      setTreeFolderActionBusy(null)
+    }
+  }
+
   async function handleOpenAtLoginToggle(): Promise<void> {
     setLoginItemBusy(true)
     setPageError(null)
@@ -1527,7 +2310,7 @@ export default function App(): JSX.Element {
     setCardFeedback(label, { tone: 'progress', message: `${progressLabel}...` })
 
     try {
-      const nextServices = sortServices(await window.launchdControl.runAction(label, action))
+      const nextServices = sortWithCurrentPreference(await window.launchdControl.runAction(label, action))
       const nextService = nextServices.find((service) => service.label === label) ?? null
 
       setServices(nextServices)
@@ -1584,7 +2367,7 @@ export default function App(): JSX.Element {
   }
 
   async function handleRename(label: string, alias: string): Promise<void> {
-    const trimmedAlias = normalizeServiceNameInput(alias)
+    const trimmedAlias = normalizeServiceTitleInput(alias)
 
     focusService(label)
     setBusyLabel(label)
@@ -1597,7 +2380,7 @@ export default function App(): JSX.Element {
       const nextServices = trimmedAlias
         ? await window.launchdControl.renameService(label, trimmedAlias)
         : await window.launchdControl.clearAlias(label)
-      const sortedServices = sortServices(nextServices)
+      const sortedServices = sortWithCurrentPreference(nextServices)
 
       setServices(sortedServices)
       setCardFeedbacks((current) => pruneCardFeedbacks(current, sortedServices))
@@ -1640,7 +2423,7 @@ export default function App(): JSX.Element {
     })
 
     try {
-      const nextServices = sortServices(await window.launchdControl.saveAutomation(label, settings))
+      const nextServices = sortWithCurrentPreference(await window.launchdControl.saveAutomation(label, settings))
 
       setServices(nextServices)
       setCardFeedbacks((current) => pruneCardFeedbacks(current, nextServices))
@@ -1666,7 +2449,7 @@ export default function App(): JSX.Element {
     })
 
     try {
-      const nextServices = sortServices(await window.launchdControl.savePlist(label, content))
+      const nextServices = sortWithCurrentPreference(await window.launchdControl.savePlist(label, content))
 
       setServices(nextServices)
       setCardFeedbacks((current) => pruneCardFeedbacks(current, nextServices))
@@ -1724,10 +2507,6 @@ export default function App(): JSX.Element {
       return
     }
 
-    if (contentPanel.mode === 'terminal') {
-      await closeEmbeddedTerminal(contentPanel.session.id)
-    }
-
     setBusyLabel(terminalService.label)
     setCardFeedback(terminalService.label, {
       tone: 'progress',
@@ -1757,12 +2536,11 @@ export default function App(): JSX.Element {
     }
   }
 
-  async function handleCloseTerminal(): Promise<void> {
+  function handleCloseTerminal(): void {
     if (contentPanel.mode !== 'terminal') {
       return
     }
 
-    await closeEmbeddedTerminal(contentPanel.session.id)
     setContentPanel(servicesPanel)
   }
 
@@ -1795,93 +2573,292 @@ export default function App(): JSX.Element {
   }
 
   return (
-    <div className="shell">
-      <aside className="masthead">
-        <div className="masthead__intro">
-          <h1>LaunchControl</h1>
-          <p className="lede">
-            Inspect user launch agents, see launchd state at a glance, and jump straight into logs,
-            runtime context, or plist details when something needs attention.
-          </p>
-        </div>
+    <div className={`shell ${sidebarCollapsed ? 'shell--sidebar-collapsed' : ''}`}>
+      <aside className={`masthead ${sidebarCollapsed ? 'is-collapsed' : ''}`}>
+        <div className="masthead__body">
+          {sidebarCollapsed ? null : sidebarSection === 'overview' ? (
+            <div className="sidebar-view sidebar-view--overview">
+              <header className="masthead__header">
+                <div className="masthead__intro">
+                  <h1>LaunchControl</h1>
+                  <p className="lede">
+                    Inspect user launch agents, see launchd state at a glance, and jump straight
+                    into logs, runtime context, or plist details when something needs attention.
+                  </p>
+                </div>
+              </header>
 
-        <div className="summary-strip">
-          <article>
-            <span>Agents</span>
-            <strong>{services.length}</strong>
-          </article>
-          <article>
-            <span>Running</span>
-            <strong>{summary.running}</strong>
-          </article>
-          <article>
-            <span>Enabled</span>
-            <strong>{summary.enabled}</strong>
-          </article>
-        </div>
-
-        <div className="masthead__panels">
-          <section className="sidebar-panel">
-            <p className="section-tag">App</p>
-            <h2>Login item</h2>
-            <div className="sidebar-fields">
-              <div>
-                <span>Status</span>
-                <strong>{openAtLogin ? 'Registered with macOS' : 'Not registered'}</strong>
+              <div className="summary-strip">
+                <article>
+                  <span>Agents</span>
+                  <strong>{services.length}</strong>
+                </article>
+                <article>
+                  <span>Running</span>
+                  <strong>{summary.running}</strong>
+                </article>
+                <article>
+                  <span>Enabled</span>
+                  <strong>{summary.enabled}</strong>
+                </article>
               </div>
+
+              <section className="sidebar-panel">
+                <div className="sidebar-panel__header">
+                  <p className="section-tag">App</p>
+                  <h2>Login item</h2>
+                </div>
+                <div className="sidebar-fields">
+                  <div>
+                    <span>Status</span>
+                    <strong>{openAtLogin ? 'Registered with macOS' : 'Not registered'}</strong>
+                  </div>
+                </div>
+                <button
+                  className="ghost-button sidebar-button"
+                  disabled={loginItemBusy}
+                  onClick={() => void handleOpenAtLoginToggle()}
+                >
+                  {loginItemBusy
+                    ? 'Updating Login Item...'
+                    : openAtLogin
+                      ? 'Remove from Login Items'
+                      : 'Add to Login Items'}
+                </button>
+              </section>
             </div>
+          ) : (
+            <div className="sidebar-view sidebar-view--services">
+              <header className="masthead__header">
+                <div className="sidebar-panel__header">
+                  <p className="section-tag">Services</p>
+                  <h2>Tree navigation</h2>
+                  <p className="sidebar-detail">
+                    {searchActive
+                      ? `${filteredServices.length} matching service${
+                          filteredServices.length === 1 ? '' : 's'
+                        }. Select a row to open the detail view in the main panel.`
+                      : `${services.length} service${
+                          services.length === 1 ? '' : 's'
+                        } grouped by folders. Select a row to open the detail view in the main panel.`}
+                  </p>
+                </div>
+              </header>
+
+	              <section className="sidebar-panel sidebar-panel--services">
+	                {services.length === 0 ? (
+	                  <p className="sidebar-empty">
+	                    No launch agents are available yet. Use New service in the toolbar to create one.
+	                  </p>
+	                ) : filteredServices.length === 0 ? (
+	                  <p className="sidebar-empty">
+	                    No services matched `{deferredSearchQuery.trim()}`.
+                  </p>
+                ) : (
+                  <div className="sidebar-tree-panel">
+                    <div className="sidebar-tree-panel__controls">
+                      <div className="tree-folder-command">
+                        <label className="tree-folder-command__field">
+                          <span>/</span>
+                          <input
+                            ref={treeFolderInputRef}
+                            aria-label="Folder path"
+                            disabled={treeBusy}
+                            onChange={(event) => {
+                              setTreeFolderDraft(event.target.value)
+                              setTreeFolderMessage(null)
+                            }}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter') {
+                                void createTreeFolderFromSelection()
+                              }
+                            }}
+                            placeholder="Folder path, for example homebrew/db"
+                            value={treeFolderDraft}
+                          />
+                        </label>
+                        <button
+                          className="ghost-button"
+                          disabled={treeBusy}
+                          onClick={() => void createTreeFolderFromSelection()}
+                          type="button"
+                        >
+                          Create folder
+                        </button>
+                      </div>
+
+                      {treeFolderMessage ? (
+                        <p className="tree-folder-command__message">{treeFolderMessage}</p>
+                      ) : null}
+
+                      {selectedTreeLabels.length > 0 ? (
+                        <div className="tree-panel__selection tree-panel__selection--sidebar">
+                          <p>
+                            {treeSelectionBusy
+                              ? `Moving ${selectedTreeLabels.length} selected service${
+                                  selectedTreeLabels.length === 1 ? '' : 's'
+                                }...`
+                              : `${selectedTreeLabels.length} selected. Click a folder or drag the selection onto a folder to move it inside LaunchControl only.`}
+                          </p>
+                          <button
+                            className="ghost-button"
+                            disabled={treeBusy}
+                            onClick={() => clearTreeSelection()}
+                            type="button"
+                          >
+                            Clear selection
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="sidebar-tree-panel__list">
+                      <ServiceTree
+                        activeLabel={selectedService?.label ?? null}
+                        draggedLabels={treeDraggedLabels}
+                        dropTargetPath={treeDropTargetPath}
+                        expandedFolders={expandedFolders}
+                        nodes={serviceTree}
+                        onDragEnd={endTreeServiceDrag}
+                        onDragServiceStart={startTreeServiceDrag}
+                        onDropLabels={moveTreeDraggedLabelsToFolder}
+                        onDropTargetChange={setTreeDropTargetPath}
+                        onOpenFolderMenu={openTreeFolderMenu}
+                        onMoveSelection={moveTreeSelectionToFolder}
+                        onSelect={focusServiceFromSidebar}
+                        onToggleSelection={toggleTreeSelection}
+                        onToggleFolder={toggleFolder}
+                        selectedLabels={selectedTreeLabels}
+                        selectionBusy={treeBusy}
+                        servicesByLabel={servicesByLabel}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {treeFolderMenu ? (
+                  <div
+                    className="tree-folder-menu"
+                    ref={treeFolderMenuRef}
+                    role="menu"
+                    style={{
+                      left: `${treeFolderMenu.left}px`,
+                      top: `${treeFolderMenu.top}px`
+                    }}
+                  >
+                    <div className="tree-folder-menu__header">
+                      <p className="eyebrow">Folder actions</p>
+                      <h4>{treeFolderMenu.name}</h4>
+                      <p className="tree-folder-menu__path">{treeFolderMenu.path}</p>
+                      <p className="tree-folder-menu__meta">
+                        {formatServiceCount(treeFolderMenu.labels.length)}
+                      </p>
+                    </div>
+
+                    <div className="tree-folder-menu__actions">
+                      {treeFolderMenuActions.map((action) => {
+                        const actionableCount = treeFolderMenu.labels.filter((label) => {
+                          const service = servicesByLabel[label]
+                          return service ? canRunTreeFolderAction(service, action) : false
+                        }).length
+
+                        return (
+                          <button
+                            key={action}
+                            className="tree-folder-menu__action"
+                            disabled={treeBusy || actionableCount === 0}
+                            onClick={() =>
+                              void handleTreeFolderAction(
+                                treeFolderMenu.path,
+                                treeFolderMenu.labels,
+                                action
+                              )
+                            }
+                            role="menuitem"
+                            type="button"
+                          >
+                            <span className="tree-folder-menu__action-label">
+                              {getTreeFolderActionLabel(action)}
+                            </span>
+                            <span className="tree-folder-menu__action-count">
+                              {actionableCount}
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                ) : null}
+              </section>
+            </div>
+          )}
+        </div>
+
+        <div className="sidebar-dock">
+          <nav className="sidebar-dock__sections" aria-label="Sidebar sections">
             <button
-              className="ghost-button sidebar-button"
-              disabled={loginItemBusy}
-              onClick={() => void handleOpenAtLoginToggle()}
+              aria-label="App sidebar"
+              aria-pressed={sidebarSection === 'overview'}
+              className={`icon-button sidebar-dock__button ${
+                sidebarSection === 'overview' ? 'is-active' : ''
+              }`}
+              onClick={() => {
+                setSidebarSection('overview')
+                setSidebarCollapsed(false)
+              }}
+              title="App"
+              type="button"
             >
-              {loginItemBusy
-                ? 'Updating Login Item...'
-                : openAtLogin
-                  ? 'Remove from Login Items'
-                  : 'Add to Login Items'}
+              <Power />
             </button>
-          </section>
+            <button
+              aria-label="Services sidebar"
+              aria-pressed={sidebarSection === 'services'}
+              className={`icon-button sidebar-dock__button ${
+                sidebarSection === 'services' ? 'is-active' : ''
+              }`}
+              onClick={() => {
+                setSidebarSection('services')
+                setServiceViewMode('tree')
+                setSidebarCollapsed(false)
+              }}
+              title="Services"
+              type="button"
+            >
+              <ListTree />
+            </button>
+          </nav>
+
+          <button
+            aria-expanded={!sidebarCollapsed}
+            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            className="icon-button sidebar-dock__button sidebar-dock__button--toggle"
+            onClick={() => setSidebarCollapsed((current) => !current)}
+            title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            type="button"
+          >
+            <span
+              className={`button-icon sidebar-toggle__icon ${
+                sidebarCollapsed ? '' : 'is-expanded'
+              }`}
+            >
+              <ChevronRight />
+            </span>
+          </button>
         </div>
       </aside>
 
       <main className="workspace">
-        <header className="topbar">
-          <div className="topbar__meta">
-            <p className="section-tag">
-              {contentPanel.mode === 'log'
-                ? `${getLogButtonLabel(contentPanel.kind)} tail`
-                : contentPanel.mode === 'terminal'
-                  ? contentPanel.terminalMode === 'logs'
-                    ? 'Embedded terminal'
-                    : 'Embedded shell'
-                : 'Service roster'}
-            </p>
-            <h2>
-              {contentPanel.mode === 'log'
-                ? 'Log window'
-                : contentPanel.mode === 'terminal'
-                  ? 'Embedded terminal'
-                  : 'User launch agents'}
-            </h2>
-            <p className="topbar__detail">
-              {contentPanel.mode === 'log'
-                ? contentPanel.title
-                : contentPanel.mode === 'terminal'
-                  ? contentPanel.session.title
-                : searchActive
-                  ? `${filteredServices.length} matching service${
-                      filteredServices.length === 1 ? '' : 's'
-                    }`
-                  : `${services.length} service${services.length === 1 ? '' : 's'} in the roster`}
-            </p>
-          </div>
-
-          <div className="topbar__controls">
-            {contentPanel.mode === 'services' ? (
-              <label className="search-field">
-                <span className="search-field__icon">
-                  <Search />
+        <header className={`topbar ${contentPanel.mode === 'services' ? 'topbar--services' : ''}`}>
+          <div
+            className={`topbar__meta ${
+              contentPanel.mode === 'services' ? 'topbar__meta--search' : ''
+            }`}
+	          >
+	            {contentPanel.mode === 'services' ? (
+	              <label className="search-field topbar__search">
+	                <span className="search-field__icon">
+	                  <Search />
                 </span>
                 <input
                   aria-label="Search services"
@@ -1901,11 +2878,107 @@ export default function App(): JSX.Element {
                   </button>
                 ) : null}
               </label>
-            ) : null}
+	            ) : contentPanel.mode === 'create' ? (
+	              <>
+	                <p className="section-tag">New launch agent</p>
+	                <h2>Create service</h2>
+	                <p className="topbar__detail">
+	                  Write a new plist into `~/Library/LaunchAgents` and then manage it from the
+	                  normal roster.
+	                </p>
+	              </>
+	            ) : (
+	              <>
+	                <p className="section-tag">
+	                  {contentPanel.mode === 'log'
+                    ? `${getLogButtonLabel(contentPanel.kind)} tail`
+                    : contentPanel.terminalMode === 'logs'
+                      ? 'Embedded terminal'
+                      : 'Embedded shell'}
+                </p>
+                <h2>{contentPanel.mode === 'log' ? 'Log window' : 'Embedded terminal'}</h2>
+                <p className="topbar__detail">
+                  {contentPanel.mode === 'log' ? contentPanel.title : contentPanel.session.title}
+                </p>
+              </>
+            )}
+          </div>
 
-            <div className="topbar__actions">
-              {contentPanel.mode === 'services' ? (
-                <div className="topbar__view-toggle" role="group" aria-label="Service view">
+          <div
+            className={`topbar__controls ${
+              contentPanel.mode === 'services' ? 'topbar__controls--services' : ''
+            }`}
+          >
+            <div className="topbar__controls-row">
+	              {contentPanel.mode === 'services' ? (
+	                <div className="topbar__sort-toggle" role="group" aria-label="Service order">
+                  <button
+                    aria-label={
+                      serviceSortField === 'name'
+                        ? serviceSortDirection === 'asc'
+                          ? 'Name order A-Z. Click to switch to Z-A.'
+                          : 'Name order Z-A. Click to switch to A-Z.'
+                        : 'Order services by name A-Z.'
+                    }
+                    aria-pressed={serviceSortField === 'name'}
+                    className={`ghost-button topbar-button ${
+                      serviceSortField === 'name' ? 'is-active' : ''
+                    }`}
+                    onClick={() => handleServiceSortToggle('name')}
+                    title={
+                      serviceSortField === 'name'
+                        ? serviceSortDirection === 'asc'
+                          ? 'Name A-Z'
+                          : 'Name Z-A'
+                        : 'Order by name'
+                    }
+                    type="button"
+                  >
+                    <span className="button-icon">
+                      {serviceSortField === 'name' && serviceSortDirection === 'desc' ? (
+                        <ArrowDownZA />
+                      ) : (
+                        <ArrowUpAZ />
+                      )}
+                    </span>
+                  </button>
+                  <button
+                    aria-label={
+                      serviceSortField === 'usage'
+                        ? serviceSortDirection === 'asc'
+                          ? 'Usage order high to low. Click to switch to low to high.'
+                          : 'Usage order low to high. Click to switch to high to low.'
+                        : 'Order services by usage, highest first.'
+                    }
+                    aria-pressed={serviceSortField === 'usage'}
+                    className={`ghost-button topbar-button ${
+                      serviceSortField === 'usage' ? 'is-active' : ''
+                    }`}
+                    onClick={() => handleServiceSortToggle('usage')}
+                    title={
+                      serviceSortField === 'usage'
+                        ? serviceSortDirection === 'asc'
+                          ? 'Usage high to low'
+                          : 'Usage low to high'
+                        : 'Order by usage'
+                    }
+                    type="button"
+                  >
+                    <span className="button-icon">
+                      {serviceSortField === 'usage' && serviceSortDirection === 'desc' ? (
+                        <ArrowDownWideNarrow />
+                      ) : (
+                        <ArrowUpWideNarrow />
+                      )}
+                    </span>
+                  </button>
+                </div>
+              ) : null}
+
+              <div className="topbar__action-stack">
+                <div className="topbar__actions">
+	              {contentPanel.mode === 'services' ? (
+	                <div className="topbar__view-toggle" role="group" aria-label="Service view">
                   <button
                     aria-label="Grid view"
                     className={`ghost-button topbar-button ${serviceViewMode === 'grid' ? 'is-active' : ''}`}
@@ -1919,31 +2992,53 @@ export default function App(): JSX.Element {
                     <span className="button-label">Grid</span>
                   </button>
                   <button
-                    aria-label="List view"
+                    aria-label="Tree view"
                     className={`ghost-button topbar-button ${serviceViewMode === 'tree' ? 'is-active' : ''}`}
-                    onClick={() => setServiceViewMode('tree')}
-                    title="List view"
+                    onClick={() => {
+                      setServiceViewMode('tree')
+                      setSidebarSection('services')
+                    }}
+                    title="Tree view"
                     type="button"
                   >
                     <span className="button-icon">
                       <ListTree />
                     </span>
-                    <span className="button-label">List</span>
+                    <span className="button-label">Tree</span>
                   </button>
                 </div>
               ) : null}
-              {contentPanel.mode === 'log' || contentPanel.mode === 'terminal' ? (
-                <button
-                  aria-label="Back to services"
-                  className="ghost-button toolbar-button topbar-button"
-                  onClick={() => {
-                    if (contentPanel.mode === 'terminal') {
+	              {contentPanel.mode === 'services' ? (
+	                <button
+	                  aria-label="Create service"
+	                  className="ghost-button toolbar-button"
+	                  disabled={createServiceBusy}
+	                  onClick={() => openCreateService()}
+	                  title="Create service"
+	                  type="button"
+	                >
+	                  <span className="button-icon">
+	                    <Plus />
+	                  </span>
+	                  <span className="button-label">
+	                    {createServiceBusy ? 'Creating service...' : 'New service'}
+	                  </span>
+	                </button>
+	              ) : null}
+	              {contentPanel.mode === 'create' ||
+	              contentPanel.mode === 'log' ||
+	              contentPanel.mode === 'terminal' ? (
+	                <button
+	                  aria-label="Back to services"
+	                  className="ghost-button toolbar-button topbar-button"
+	                  onClick={() => {
+	                    if (contentPanel.mode === 'terminal') {
                       void handleCloseTerminal()
-                      return
-                    }
+	                      return
+	                    }
 
-                    setContentPanel(servicesPanel)
-                  }}
+	                    setContentPanel(servicesPanel)
+	                  }}
                   title="Back to services"
                 >
                   <span className="button-icon">
@@ -1984,19 +3079,19 @@ export default function App(): JSX.Element {
                   <span className="button-label">Refresh log</span>
                 </button>
               ) : null}
-              {contentPanel.mode === 'services' ? (
-                <button
-                  aria-label="Refresh snapshot"
-                  className="ghost-button toolbar-button topbar-button"
-                  disabled={loading}
-                  onClick={() => void loadServices()}
-                  title="Refresh snapshot"
-                  type="button"
+	              {contentPanel.mode === 'services' ? (
+	                <button
+	                  aria-label="Refresh roster"
+	                  className="ghost-button toolbar-button topbar-button"
+	                  disabled={loading || createServiceBusy}
+	                  onClick={() => void loadServices()}
+	                  title="Refresh roster"
+	                  type="button"
                 >
                   <span className="button-icon">
                     <RefreshCcw />
                   </span>
-                  <span className="button-label">Refresh snapshot</span>
+                  <span className="button-label">Refresh roster</span>
                 </button>
               ) : null}
               {terminalService ? (
@@ -2014,6 +3109,21 @@ export default function App(): JSX.Element {
                   <span className="button-label">Open terminal</span>
                 </button>
               ) : null}
+                </div>
+                {contentPanel.mode === 'services' && services.length > 0 ? (
+                  <div
+                    className={`live-indicator ${liveRefreshPaused ? 'is-paused' : ''}`}
+                    title={
+                      liveRefreshPaused
+                        ? 'Background usage polling pauses while LaunchControl is busy applying another change.'
+                        : `Usage metrics refresh in the background every ${liveRefreshIntervalMs / 1000}s. Use Refresh roster to detect added or removed plists.`
+                    }
+                  >
+                    <span aria-hidden="true" className="live-indicator__dot" />
+                    <span>{liveRefreshPaused ? 'Usage paused' : 'Usage live'}</span>
+                  </div>
+                ) : null}
+              </div>
             </div>
           </div>
         </header>
@@ -2023,10 +3133,16 @@ export default function App(): JSX.Element {
         <section className="service-region">
           {loading ? (
             <div className="empty-state">Loading launch agents...</div>
-          ) : contentPanel.mode === 'log' ? (
-            <LogPanel
-              busy={busyLabel === contentPanel.serviceLabel}
-              onAction={handleAction}
+	          ) : contentPanel.mode === 'create' ? (
+	            <CreateServicePanel
+	              busy={createServiceBusy}
+	              onCancel={() => setContentPanel(servicesPanel)}
+	              onCreate={handleCreateService}
+	            />
+	          ) : contentPanel.mode === 'log' ? (
+	            <LogPanel
+	              busy={busyLabel === contentPanel.serviceLabel}
+	              onAction={handleAction}
               onLog={openLog}
               onOpenTerminal={() => void handleOpenTerminal()}
               panel={contentPanel}
@@ -2035,111 +3151,32 @@ export default function App(): JSX.Element {
           ) : contentPanel.mode === 'terminal' ? (
             <TerminalPanel
               panel={contentPanel}
-              service={terminalService}
-              onBack={() => void handleCloseTerminal()}
-            />
-          ) : services.length === 0 ? (
-            <div className="empty-state">
-              No `~/Library/LaunchAgents` plists were found for this user.
-            </div>
+	              service={terminalService}
+	              onBack={() => void handleCloseTerminal()}
+	            />
+	          ) : services.length === 0 ? (
+	            <div className="empty-state">
+	              No `~/Library/LaunchAgents` plists were found for this user yet. Use New service
+	              to create one.
+	            </div>
           ) : filteredServices.length === 0 ? (
             <div className="empty-state">
               No services matched `{deferredSearchQuery.trim()}`.
             </div>
           ) : serviceViewMode === 'tree' ? (
-            <div className="service-layout">
-              <article className="tree-panel">
-                <header className="tree-panel__header">
-                  <div>
-                    <p className="eyebrow">Service tree</p>
-                    <h3>Grouped agents</h3>
-                  </div>
-                  <p className="tree-panel__hint">
-                    Press `/` to create a folder from the checked services. If nothing is checked,
-                    the active service moves into the new folder.
-                  </p>
-                  <div
-                    className="tree-folder-command"
-                  >
-                    <label className="tree-folder-command__field">
-                      <span>/</span>
-                      <input
-                        ref={treeFolderInputRef}
-                        aria-label="Folder path"
-                        disabled={treeSelectionBusy}
-                        onChange={(event) => {
-                          setTreeFolderDraft(event.target.value)
-                          setTreeFolderMessage(null)
-                        }}
-                        onKeyDown={(event) => {
-                          if (event.key === 'Enter') {
-                            void createTreeFolderFromSelection()
-                          }
-                        }}
-                        placeholder="Folder path"
-                        value={treeFolderDraft}
-                      />
-                    </label>
-                    <button
-                      className="ghost-button"
-                      disabled={treeSelectionBusy}
-                      onClick={() => void createTreeFolderFromSelection()}
-                      type="button"
-                    >
-                      Create folder
-                    </button>
-                  </div>
-                  {treeFolderMessage ? (
-                    <p className="tree-folder-command__message">{treeFolderMessage}</p>
-                  ) : null}
-                  {selectedTreeLabels.length > 0 ? (
-                    <div className="tree-panel__selection">
-                      <p>
-                        {treeSelectionBusy
-                          ? `Moving ${selectedTreeLabels.length} selected service${
-                              selectedTreeLabels.length === 1 ? '' : 's'
-                            }...`
-                          : `${selectedTreeLabels.length} selected. Click a folder to move them inside LaunchControl only. This never changes ~/Library/LaunchAgents.`}
-                      </p>
-                      <button
-                        className="ghost-button"
-                        disabled={treeSelectionBusy}
-                        onClick={() => clearTreeSelection()}
-                        type="button"
-                      >
-                        Clear selection
-                      </button>
-                    </div>
-                  ) : null}
-                </header>
-
-                <ServiceTree
-                  activeLabel={selectedService?.label ?? null}
-                  expandedFolders={expandedFolders}
-                  nodes={serviceTree}
-                  onMoveSelection={moveTreeSelectionToFolder}
-                  onSelect={focusService}
-                  onToggleSelection={toggleTreeSelection}
-                  onToggleFolder={toggleFolder}
-                  selectedLabels={selectedTreeLabels}
-                  selectionBusy={treeSelectionBusy}
-                  servicesByLabel={servicesByLabel}
-                />
-              </article>
-
-              <TreeServiceDetail
-                busyLabel={busyLabel}
-                feedbacks={cardFeedbacks}
-                onAction={handleAction}
-                onLog={openLog}
-                onRename={handleRename}
-                onSaveAutomation={handleAutomationSave}
-                onSavePlist={handlePlistSave}
-                onSelect={focusService}
-                service={selectedService}
-                services={services}
-              />
-            </div>
+            <TreeServiceDetail
+              busyLabel={busyLabel}
+              feedbacks={cardFeedbacks}
+              onAction={handleAction}
+              onLog={openLog}
+              onRename={handleRename}
+              onSaveAutomation={handleAutomationSave}
+              onSavePlist={handlePlistSave}
+              onSelect={focusService}
+              service={selectedService}
+              services={services}
+              treeBusy={treeBusy}
+            />
           ) : (
             <div className="service-grid">
               {filteredServices.map((service, index) => (
@@ -2165,10 +3202,333 @@ export default function App(): JSX.Element {
   )
 }
 
+function CreateServicePanel({
+  busy,
+  onCreate,
+  onCancel
+}: {
+  busy: boolean
+  onCreate: (input: CreateLaunchdServiceInput) => Promise<void>
+  onCancel: () => void
+}): JSX.Element {
+  const [label, setLabel] = useState(defaultCreateServiceLabel)
+  const [draftContent, setDraftContent] = useState(() =>
+    buildNewServiceTemplate(defaultCreateServiceLabel)
+  )
+  const [localError, setLocalError] = useState<string | null>(null)
+  const [localMessage, setLocalMessage] = useState<string | null>(null)
+  const [copiedSnippetKey, setCopiedSnippetKey] = useState<string | null>(null)
+  const labelInputRef = useRef<HTMLInputElement | null>(null)
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const selectionRef = useRef({ start: 0, end: 0 })
+  const templateRef = useRef(buildNewServiceTemplate(defaultCreateServiceLabel))
+  const normalizedLabel = normalizeServiceLabelInput(label)
+  const previewLabel = normalizedLabel || defaultCreateServiceLabel
+  const destinationPath = buildLaunchAgentPath(previewLabel)
+
+  useEffect(() => {
+    window.requestAnimationFrame(() => {
+      labelInputRef.current?.focus()
+      labelInputRef.current?.select()
+    })
+  }, [])
+
+  useEffect(() => {
+    if (!copiedSnippetKey) {
+      return
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setCopiedSnippetKey(null)
+    }, 1800)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [copiedSnippetKey])
+
+  function syncSelection(target: HTMLTextAreaElement): void {
+    selectionRef.current = {
+      start: target.selectionStart,
+      end: target.selectionEnd
+    }
+  }
+
+  function handleLabelChange(nextValue: string): void {
+    const nextLabel = normalizeServiceLabelInput(nextValue) || defaultCreateServiceLabel
+    const nextTemplate = buildNewServiceTemplate(nextLabel)
+    const shouldSyncTemplate = draftContent === templateRef.current
+
+    templateRef.current = nextTemplate
+    setLabel(nextValue)
+    setLocalError(null)
+    setLocalMessage(null)
+
+    if (shouldSyncTemplate) {
+      setDraftContent(nextTemplate)
+      selectionRef.current = { start: 0, end: 0 }
+    }
+  }
+
+  function resetTemplate(): void {
+    const nextTemplate = buildNewServiceTemplate(previewLabel)
+
+    templateRef.current = nextTemplate
+    setDraftContent(nextTemplate)
+    setLocalError(null)
+    setLocalMessage('Reset the template to match the current label.')
+    selectionRef.current = {
+      start: nextTemplate.length,
+      end: nextTemplate.length
+    }
+
+    window.requestAnimationFrame(() => {
+      const textarea = textareaRef.current
+
+      if (!textarea) {
+        return
+      }
+
+      textarea.focus()
+      textarea.setSelectionRange(nextTemplate.length, nextTemplate.length)
+    })
+  }
+
+  async function handleSnippetCopy(snippet: LaunchdPlistSnippet): Promise<void> {
+    try {
+      await copyTextToClipboard(snippet.snippet)
+      setCopiedSnippetKey(snippet.key)
+      setLocalError(null)
+      setLocalMessage(`Copied ${snippet.title}.`)
+    } catch (copyError) {
+      setLocalError(copyError instanceof Error ? copyError.message : String(copyError))
+    }
+  }
+
+  function insertSnippet(snippet: LaunchdPlistSnippet): void {
+    const textarea = textareaRef.current
+    const selectionStart = textarea?.selectionStart ?? selectionRef.current.start
+    const selectionEnd = textarea?.selectionEnd ?? selectionRef.current.end
+    const textToInsert = snippet.insertText ?? snippet.snippet
+    const head = draftContent.slice(0, selectionStart)
+    const tail = draftContent.slice(selectionEnd)
+    const prefix = head.length > 0 && !head.endsWith('\n') ? '\n' : ''
+    const suffix = tail.length > 0 && !tail.startsWith('\n') ? '\n' : ''
+    const inserted = `${prefix}${textToInsert}${suffix}`
+    const nextContent = `${head}${inserted}${tail}`
+    const cursor = head.length + inserted.length
+
+    setDraftContent(nextContent)
+    setLocalError(null)
+    setLocalMessage(`Inserted ${snippet.title} at the cursor.`)
+    selectionRef.current = { start: cursor, end: cursor }
+
+    window.requestAnimationFrame(() => {
+      const nextTextarea = textareaRef.current
+
+      if (!nextTextarea) {
+        return
+      }
+
+      nextTextarea.focus()
+      nextTextarea.setSelectionRange(cursor, cursor)
+    })
+  }
+
+  function handleSnippetKeyDown(
+    event: KeyboardEvent<HTMLElement>,
+    snippet: LaunchdPlistSnippet
+  ): void {
+    if (event.key !== 'Enter' && event.key !== ' ') {
+      return
+    }
+
+    event.preventDefault()
+    void handleSnippetCopy(snippet)
+  }
+
+  async function submit(): Promise<void> {
+    if (!normalizedLabel) {
+      setLocalError('Service label is required.')
+      labelInputRef.current?.focus()
+      return
+    }
+
+    if (!serviceLabelPattern.test(normalizedLabel)) {
+      setLocalError('Use letters, numbers, dots, dashes, and underscores only.')
+      labelInputRef.current?.focus()
+      return
+    }
+
+    if (!draftContent.trim()) {
+      setLocalError('Plist content is required.')
+      textareaRef.current?.focus()
+      return
+    }
+
+    setLocalError(null)
+    setLocalMessage(null)
+
+    try {
+      await onCreate({
+        label: normalizedLabel,
+        plistContent: draftContent
+      })
+    } catch (createError) {
+      setLocalError(createError instanceof Error ? createError.message : String(createError))
+    }
+  }
+
+  return (
+    <section className="detail-panel source-panel create-service-panel">
+      <header className="detail-panel__header detail-panel__header--split">
+        <div>
+          <p className="eyebrow">New launch agent</p>
+          <h3>Create service</h3>
+          <p className="detail-panel__summary">
+            The plist Label and the destination filename stay aligned. LaunchControl validates the
+            XML before it writes the new service into your LaunchAgents folder.
+          </p>
+        </div>
+        <div className="create-service-panel__destination">
+          <span>Destination</span>
+          <strong>{destinationPath}</strong>
+        </div>
+      </header>
+
+      {localError ? <div className="error-banner">{localError}</div> : null}
+
+      <div className="plist-editor is-editing">
+        <div className="create-service-panel__fields">
+          <label className="field-group">
+            <span>Service label</span>
+            <input
+              ref={labelInputRef}
+              autoCapitalize="off"
+              autoCorrect="off"
+              onChange={(event) => handleLabelChange(event.target.value)}
+              placeholder="com.example.agent"
+              spellCheck={false}
+              value={label}
+            />
+          </label>
+          <p className="sidebar-detail">
+            Use a reverse-DNS style label like `com.acme.worker`. The plist `Label` key must match
+            this value exactly.
+          </p>
+        </div>
+
+        <div className="plist-editor__workspace">
+          <label className="field-group">
+            <span>Raw plist XML</span>
+            <textarea
+              ref={textareaRef}
+              className="plist-editor__textarea"
+              onChange={(event) => {
+                setDraftContent(event.target.value)
+                syncSelection(event.target)
+                setLocalError(null)
+                setLocalMessage(null)
+              }}
+              onClick={(event) => syncSelection(event.currentTarget)}
+              onKeyUp={(event) => syncSelection(event.currentTarget)}
+              onSelect={(event) => syncSelection(event.currentTarget)}
+              spellCheck={false}
+              value={draftContent}
+            />
+          </label>
+
+          <aside className="plist-library" aria-label="launchd plist snippets">
+            <header className="plist-library__header">
+              <h4>Insert library</h4>
+              <p>Copy a snippet or insert it at the cursor.</p>
+            </header>
+
+            <div className="plist-library__list">
+              {[
+                { key: 'plist', title: '.plist keys', snippets: launchdPlistLibrary },
+                { key: 'launchd', title: 'launchd commands', snippets: launchdCommandLibrary }
+              ].map((section) => (
+                <section key={section.key} className="plist-library__section">
+                  <h5>{section.title}</h5>
+                  {section.snippets.map((snippet) => {
+                    const copied = copiedSnippetKey === snippet.key
+
+                    return (
+                      <article
+                        key={snippet.key}
+                        aria-label={`${snippet.title} snippet`}
+                        className={`plist-snippet-card ${copied ? 'is-copied' : ''}`}
+                        onClick={() => void handleSnippetCopy(snippet)}
+                        onKeyDown={(event) => handleSnippetKeyDown(event, snippet)}
+                        role="button"
+                        tabIndex={0}
+                      >
+                        <div className="plist-snippet-card__header">
+                          <div>
+                            <strong>{snippet.title}</strong>
+                            <p>{snippet.description}</p>
+                          </div>
+                          <span className="plist-snippet-card__badge">
+                            {copied ? 'Copied' : 'Copy'}
+                          </span>
+                        </div>
+                        <pre className="plist-snippet-card__preview">{snippet.snippet}</pre>
+                        <button
+                          className="ghost-button sidebar-button"
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            insertSnippet(snippet)
+                          }}
+                          type="button"
+                        >
+                          Insert
+                        </button>
+                      </article>
+                    )
+                  })}
+                </section>
+              ))}
+            </div>
+          </aside>
+        </div>
+
+        {localMessage ? <p className="sidebar-detail">{localMessage}</p> : null}
+
+        <div className="panel-actions plist-editor__actions">
+          <button
+            className="ghost-button sidebar-button"
+            disabled={busy}
+            onClick={() => void submit()}
+            type="button"
+          >
+            {busy ? 'Creating service...' : 'Create service'}
+          </button>
+          <button
+            className="ghost-button sidebar-button"
+            disabled={busy}
+            onClick={() => resetTemplate()}
+            type="button"
+          >
+            Reset template
+          </button>
+          <button
+            className="ghost-button sidebar-button"
+            disabled={busy}
+            onClick={onCancel}
+            type="button"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    </section>
+  )
+}
+
 function TreeServiceDetail({
   service,
   services,
   busyLabel,
+  treeBusy,
   feedbacks,
   onSelect,
   onAction,
@@ -2180,6 +3540,7 @@ function TreeServiceDetail({
   service: LaunchdService | null
   services: LaunchdService[]
   busyLabel: string | null
+  treeBusy: boolean
   feedbacks: Record<string, CardFeedback>
   onSelect: (label: string) => void
   onAction: (label: string, action: LaunchdAction) => Promise<void>
@@ -2237,7 +3598,7 @@ function TreeServiceDetail({
       <ServiceCard
         active
         allServices={services}
-        busy={busyLabel === service.label}
+        busy={treeBusy || busyLabel === service.label}
         delayIndex={0}
         feedback={feedbacks[service.label] ?? getDefaultCardFeedback(service)}
         onAction={onAction}
@@ -2255,7 +3616,7 @@ function TreeServiceDetail({
         </header>
 
         <AutomationPanel
-          busy={busyLabel === service.label}
+          busy={treeBusy || busyLabel === service.label}
           onSave={onSaveAutomation}
           service={service}
           services={services}
@@ -2263,7 +3624,7 @@ function TreeServiceDetail({
       </section>
 
       <LaunchdPlistEditorPanel
-        busy={busyLabel === service.label}
+        busy={treeBusy || busyLabel === service.label}
         onSave={onSavePlist}
         service={service}
       />
@@ -2625,10 +3986,17 @@ function LaunchdPlistEditorPanel({
 function ServiceTree({
   nodes,
   activeLabel,
+  draggedLabels,
+  dropTargetPath,
   expandedFolders,
   selectedLabels,
   selectionBusy,
   servicesByLabel,
+  onDragEnd,
+  onDragServiceStart,
+  onDropLabels,
+  onDropTargetChange,
+  onOpenFolderMenu,
   onMoveSelection,
   onSelect,
   onToggleSelection,
@@ -2637,10 +4005,17 @@ function ServiceTree({
 }: {
   nodes: ServiceTreeNode[]
   activeLabel: string | null
+  draggedLabels: string[]
+  dropTargetPath: string | null
   expandedFolders: Record<string, boolean>
   selectedLabels: string[]
   selectionBusy: boolean
   servicesByLabel: Record<string, LaunchdService>
+  onDragEnd: () => void
+  onDragServiceStart: (label: string) => string[]
+  onDropLabels: (labels: string[], folderPath: string) => Promise<void>
+  onDropTargetChange: (folderPath: string | null) => void
+  onOpenFolderMenu: (folder: ServiceTreeFolder, clientX: number, clientY: number) => void
   onMoveSelection: (folderPath: string) => Promise<void>
   onSelect: (label: string) => void
   onToggleSelection: (label: string) => void
@@ -2648,6 +4023,7 @@ function ServiceTree({
   level?: number
 }): JSX.Element {
   const selectedSet = new Set(selectedLabels)
+  const draggedSet = new Set(draggedLabels)
 
   return (
     <ul className="service-tree">
@@ -2663,6 +4039,21 @@ function ServiceTree({
               const service = servicesByLabel[label]
               return service ? getServiceFolderPath(service) !== node.path : false
             })
+          const canReceiveDrop =
+            !selectionBusy &&
+            draggedLabels.some((label) => {
+              const service = servicesByLabel[label]
+              return service ? getServiceFolderPath(service) !== node.path : false
+            })
+          const isDropTarget = canMoveSelection || canReceiveDrop
+          const isDragOver = canReceiveDrop && dropTargetPath === node.path
+          const folderMeta = canReceiveDrop
+            ? `Drop ${draggedLabels.length} here`
+            : canMoveSelection
+              ? `Move ${selectedLabels.length} here`
+              : node.runningCount > 0
+                ? `${node.runningCount}/${node.serviceCount} running`
+                : `${node.serviceCount} item${node.serviceCount === 1 ? '' : 's'}`
 
           const handleFolderClick = (): void => {
             if (canMoveSelection) {
@@ -2673,13 +4064,84 @@ function ServiceTree({
             onToggleFolder(node.path)
           }
 
+          const handleFolderDragEnter = (event: DragEvent<HTMLDivElement>): void => {
+            if (!canReceiveDrop) {
+              return
+            }
+
+            event.preventDefault()
+            event.dataTransfer.dropEffect = 'move'
+            onDropTargetChange(node.path)
+          }
+
+          const handleFolderDragLeave = (event: DragEvent<HTMLDivElement>): void => {
+            const nextTarget = event.relatedTarget
+
+            if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) {
+              return
+            }
+
+            if (dropTargetPath === node.path) {
+              onDropTargetChange(null)
+            }
+          }
+
+          const handleFolderDragOver = (event: DragEvent<HTMLDivElement>): void => {
+            if (!canReceiveDrop) {
+              return
+            }
+
+            event.preventDefault()
+            event.dataTransfer.dropEffect = 'move'
+            onDropTargetChange(node.path)
+          }
+
+          const handleFolderDrop = (event: DragEvent<HTMLDivElement>): void => {
+            if (!canReceiveDrop) {
+              return
+            }
+
+            event.preventDefault()
+            event.stopPropagation()
+
+            const transferredLabels = getTreeDragTransferLabels(event.dataTransfer)
+            void onDropLabels(
+              transferredLabels.length > 0 ? transferredLabels : draggedLabels,
+              node.path
+            )
+          }
+
+          const handleFolderContextMenu = (event: MouseEvent<HTMLDivElement>): void => {
+            event.preventDefault()
+            event.stopPropagation()
+            onOpenFolderMenu(node, event.clientX, event.clientY)
+          }
+
+          const handleFolderKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
+            if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) {
+              event.preventDefault()
+              const bounds = event.currentTarget.getBoundingClientRect()
+              onOpenFolderMenu(node, bounds.left + 24, bounds.bottom - 8)
+              return
+            }
+
+            handleTreeRowKeyDown(event, handleFolderClick)
+          }
+
           return (
             <li key={node.path}>
               <div
                 aria-expanded={expanded}
-                className={`tree-row tree-row--folder ${canMoveSelection ? 'is-drop-target' : ''}`}
+                className={`tree-row tree-row--folder ${isDropTarget ? 'is-drop-target' : ''} ${
+                  isDragOver ? 'is-drag-over' : ''
+                }`}
                 onClick={handleFolderClick}
-                onKeyDown={(event) => handleTreeRowKeyDown(event, handleFolderClick)}
+                onDragEnter={handleFolderDragEnter}
+                onDragLeave={handleFolderDragLeave}
+                onDragOver={handleFolderDragOver}
+                onDrop={handleFolderDrop}
+                onContextMenu={handleFolderContextMenu}
+                onKeyDown={handleFolderKeyDown}
                 role="button"
                 style={rowStyle}
                 tabIndex={0}
@@ -2702,20 +4164,21 @@ function ServiceTree({
                   <Folder />
                 </span>
                 <span className="tree-row__label">{node.name}</span>
-                <span className="tree-row__meta">
-                  {canMoveSelection
-                    ? `Move ${selectedLabels.length} here`
-                    : node.runningCount > 0
-                      ? `${node.runningCount}/${node.serviceCount} running`
-                      : `${node.serviceCount} item${node.serviceCount === 1 ? '' : 's'}`}
-                </span>
+                <span className="tree-row__meta">{folderMeta}</span>
               </div>
               {expanded ? (
                 <ServiceTree
                   activeLabel={activeLabel}
+                  draggedLabels={draggedLabels}
+                  dropTargetPath={dropTargetPath}
                   expandedFolders={expandedFolders}
                   level={level + 1}
                   nodes={node.children}
+                  onDragEnd={onDragEnd}
+                  onDragServiceStart={onDragServiceStart}
+                  onDropLabels={onDropLabels}
+                  onDropTargetChange={onDropTargetChange}
+                  onOpenFolderMenu={onOpenFolderMenu}
                   onMoveSelection={onMoveSelection}
                   onSelect={onSelect}
                   onToggleSelection={onToggleSelection}
@@ -2730,15 +4193,30 @@ function ServiceTree({
         }
 
         const isSelected = selectedSet.has(node.service.label)
+        const isDragging = draggedSet.has(node.service.label)
         const handleServiceClick = (): void => onSelect(node.service.label)
+        const handleServiceDragStart = (event: DragEvent<HTMLDivElement>): void => {
+          if (selectionBusy) {
+            event.preventDefault()
+            return
+          }
+
+          const labels = onDragServiceStart(node.service.label)
+          event.dataTransfer.effectAllowed = 'move'
+          event.dataTransfer.setData(treeServiceLabelsMimeType, JSON.stringify(labels))
+          event.dataTransfer.setData('text/plain', labels.join('\n'))
+        }
 
         return (
           <li key={node.path}>
             <div
               className={`tree-row tree-row--service ${
                 node.service.label === activeLabel ? 'is-active' : ''
-              } ${isSelected ? 'is-selected' : ''}`}
+              } ${isSelected ? 'is-selected' : ''} ${isDragging ? 'is-dragging' : ''}`}
+              draggable={!selectionBusy}
               onClick={handleServiceClick}
+              onDragEnd={onDragEnd}
+              onDragStart={handleServiceDragStart}
               onKeyDown={(event) => handleTreeRowKeyDown(event, handleServiceClick)}
               role="button"
               style={rowStyle}
@@ -2764,7 +4242,9 @@ function ServiceTree({
                 <FileText />
               </span>
               <span className="tree-row__label">{node.leafName}</span>
-              <span className="tree-row__meta">{isSelected ? 'selected' : node.service.status}</span>
+              <span className="tree-row__meta">
+                {isDragging ? 'dragging' : isSelected ? 'selected' : node.service.status}
+              </span>
             </div>
           </li>
         )
@@ -2990,6 +4470,32 @@ function AutomationPanel({
   )
 }
 
+const ServiceUsageGrid = memo(function ServiceUsageGrid({
+  serviceLabel,
+  fallbackLoad
+}: {
+  serviceLabel: string
+  fallbackLoad: ServiceLoadSnapshot
+}): JSX.Element {
+  const usageLoad = useServiceUsageSnapshot(serviceLabel)
+  const load = usageLoad ?? fallbackLoad
+
+  return (
+    <div className="service-card__load-grid">
+      {getServiceLoadMetrics(load).map((metric) => (
+        <div
+          key={metric.label}
+          className={`load-metric ${metric.unavailable ? 'is-unavailable' : ''}`}
+          title={metric.title}
+        >
+          <span className="load-metric__label">{metric.label}</span>
+          <strong className="load-metric__value">{metric.value}</strong>
+        </div>
+      ))}
+    </div>
+  )
+})
+
 function ServiceCard({
   service,
   allServices,
@@ -3040,7 +4546,7 @@ function ServiceCard({
 
   function submitRename(): void {
     setEditing(false)
-    const nextAlias = resolveServiceAliasInput(service, draftName)
+    const nextAlias = resolveServiceAliasInput(draftName)
     void onRename(service.label, nextAlias === service.label ? '' : nextAlias)
   }
 
@@ -3084,7 +4590,7 @@ function ServiceCard({
                   ref={titleInputRef}
                   className="title-editor__input"
                   onChange={(event) => setDraftName(event.target.value)}
-                  placeholder="Use / to create folders"
+                  placeholder="Custom title"
                   onKeyDown={handleKeyDown}
                   value={draftName}
                 />
@@ -3134,18 +4640,7 @@ function ServiceCard({
 
         <p className="service-card__label">{service.plistName ?? service.label}</p>
         {service.serviceInfo ? <p className="service-card__info">{service.serviceInfo}</p> : null}
-        <div className="service-card__load-grid">
-          {getServiceLoadMetrics(service.load).map((metric) => (
-            <div
-              key={metric.label}
-              className={`load-metric ${metric.unavailable ? 'is-unavailable' : ''}`}
-              title={metric.title}
-            >
-              <span className="load-metric__label">{metric.label}</span>
-              <strong className="load-metric__value">{metric.value}</strong>
-            </div>
-          ))}
-        </div>
+        <ServiceUsageGrid fallbackLoad={service.load} serviceLabel={service.label} />
 
         <div className="service-card__meta">
           <div className="service-card__signals">
@@ -3378,6 +4873,7 @@ function TerminalPanel({
     }
 
     setExitState(null)
+    let sessionActive = true
     const term = new XTerm({
       allowTransparency: true,
       convertEol: true,
@@ -3412,6 +4908,10 @@ function TerminalPanel({
     })
     const fitAddon = new FitAddon()
     const terminalInput = term.onData((data) => {
+      if (!sessionActive) {
+        return
+      }
+
       window.launchdControl.writeTerminal(panel.session.id, data)
     })
     const unsubscribeData = window.launchdControl.onTerminalData((event) => {
@@ -3426,6 +4926,7 @@ function TerminalPanel({
         return
       }
 
+      sessionActive = false
       setExitState(event)
       term.write(
         `\r\n\x1b[33m[terminal exited with code ${event.exitCode}${
@@ -3435,6 +4936,11 @@ function TerminalPanel({
     })
     const resizeObserver = new ResizeObserver(() => {
       fitAddon.fit()
+
+      if (!sessionActive) {
+        return
+      }
+
       window.launchdControl.resizeTerminal(panel.session.id, term.cols, term.rows)
     })
 
@@ -3446,6 +4952,7 @@ function TerminalPanel({
     resizeObserver.observe(host)
 
     return () => {
+      sessionActive = false
       resizeObserver.disconnect()
       unsubscribeExit()
       unsubscribeData()
