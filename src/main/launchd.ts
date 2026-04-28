@@ -1,10 +1,11 @@
 import { execFile } from 'node:child_process'
-import { access, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { constants } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
-import { basename, dirname, extname, join } from 'node:path'
+import { homedir } from 'node:os'
+import { basename, dirname, extname, isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
 import type {
+  CreateLaunchdServiceInput,
   LaunchdAction,
   LaunchdPlistDocument,
   LaunchdPlistField,
@@ -26,6 +27,7 @@ const uid = process.getuid?.() ?? Number(process.env.UID ?? 0)
 const userDomain = `gui/${uid}`
 const launchAgentsDir = join(homedir(), 'Library', 'LaunchAgents')
 const logLineCount = 300
+const serviceLabelPattern = /^[A-Za-z0-9._-]+$/
 
 interface RuntimeState {
   loaded: boolean
@@ -56,6 +58,13 @@ interface PsProcessSnapshot {
   memoryPercent: number | null
   residentMemoryBytes: number | null
   virtualMemoryBytes: number | null
+}
+
+interface RuntimeSnapshotBundle {
+  runtimeMap: Map<string, RuntimeState>
+  disabledMap: Map<string, boolean>
+  loadMap: Map<number, ServiceLoadSnapshot>
+  sampledAt: string
 }
 
 function toStringArray(value: unknown): string[] {
@@ -362,7 +371,7 @@ function parsePsProcessSnapshots(output: string): Map<number, PsProcessSnapshot>
       cpuPercent: parseNumber(cpuToken),
       memoryPercent: parseNumber(memoryToken),
       residentMemoryBytes: residentKilobytes === null ? null : Math.round(residentKilobytes * 1024),
-      virtualMemoryBytes: virtualBytes === null ? null : Math.round(virtualBytes)
+      virtualMemoryBytes: virtualBytes === null ? null : Math.round(virtualBytes * 1024)
     })
   }
 
@@ -452,9 +461,165 @@ function parseDisabledMap(output: string): Map<string, boolean> {
   return disabledMap
 }
 
+async function collectRuntimeSnapshotBundle(): Promise<RuntimeSnapshotBundle> {
+  const [listOutput, disabledOutput] = await Promise.all([
+    runLaunchctl(['list']),
+    runLaunchctl(['print-disabled', userDomain])
+  ])
+  const runtimeMap = parseLaunchctlList(listOutput)
+  const disabledMap = parseDisabledMap(disabledOutput)
+  const sampledAt = new Date().toISOString()
+  const loadMap = await collectProcessLoadSnapshots(
+    [...runtimeMap.values()].flatMap((runtime) => (runtime.pid && runtime.pid > 0 ? [runtime.pid] : []))
+  ).catch(() => new Map<number, ServiceLoadSnapshot>())
+
+  return {
+    runtimeMap,
+    disabledMap,
+    loadMap,
+    sampledAt
+  }
+}
+
+function buildServiceLoadSnapshot(
+  pid: number | null,
+  loadMap: Map<number, ServiceLoadSnapshot>,
+  sampledAt: string
+): ServiceLoadSnapshot {
+  if (pid && pid > 0) {
+    return loadMap.get(pid) ?? {
+      ...createEmptyLoadSnapshot(sampledAt),
+      cpuPercent: null,
+      residentMemoryBytes: null,
+      virtualMemoryBytes: null,
+      memoryPercent: null,
+      energyImpact: null,
+      threads: null,
+      state: null
+    }
+  }
+
+  return createEmptyLoadSnapshot(sampledAt)
+}
+
+function applyRuntimeSnapshotToService(
+  service: LaunchdService,
+  snapshots: RuntimeSnapshotBundle
+): LaunchdService {
+  const runtime = snapshots.runtimeMap.get(service.label)
+  const enabled = snapshots.disabledMap.get(service.label) ?? true
+  const pid = runtime?.pid ?? null
+
+  return {
+    ...service,
+    enabled,
+    loaded: runtime?.loaded ?? false,
+    running: runtime?.running ?? false,
+    pid,
+    lastExitStatus: runtime?.lastExitStatus ?? null,
+    status:
+      runtime?.running ?? false
+        ? 'running'
+        : runtime?.loaded
+          ? 'loaded'
+          : 'stopped',
+    load: buildServiceLoadSnapshot(pid, snapshots.loadMap, snapshots.sampledAt)
+  }
+}
+
 async function parsePlistJson(plistPath: string): Promise<Record<string, unknown>> {
   const json = await run('/usr/bin/plutil', ['-convert', 'json', '-o', '-', plistPath])
   return JSON.parse(json) as Record<string, unknown>
+}
+
+function getAbsolutePlistPath(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  const normalized = value.trim()
+  return normalized && isAbsolute(normalized) ? normalized : null
+}
+
+function normalizeServiceLabelInput(value: string): string {
+  return value.trim()
+}
+
+function assertValidServiceLabel(value: string): string {
+  const label = normalizeServiceLabelInput(value)
+
+  if (!label) {
+    throw new Error('Service label is required.')
+  }
+
+  if (!serviceLabelPattern.test(label)) {
+    throw new Error(
+      'Service label may only contain letters, numbers, dots, dashes, and underscores.'
+    )
+  }
+
+  return label
+}
+
+function formatPlistValidationMessage(error: unknown, fallbackMessage: string): string {
+  const message = error instanceof Error ? error.message : String(error)
+  return message.replace(/^Command failed:[^\n]*\n?/, '').trim() || fallbackMessage
+}
+
+async function ensureDirectoryPath(path: string, label: string): Promise<void> {
+  try {
+    await mkdir(path, { recursive: true })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(`Could not create ${label} at ${path}: ${message}`)
+  }
+}
+
+async function ensureFilePath(path: string, label: string): Promise<void> {
+  try {
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, '', { flag: 'a' })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(`Could not create ${label} at ${path}: ${message}`)
+  }
+}
+
+async function ensurePlistFilesystemTargets(plist: Record<string, unknown>): Promise<void> {
+  const workingDirectory = getAbsolutePlistPath(plist.WorkingDirectory)
+
+  if (workingDirectory) {
+    await ensureDirectoryPath(workingDirectory, 'WorkingDirectory')
+  }
+
+  for (const directory of toStringArray(plist.QueueDirectories)) {
+    if (isAbsolute(directory)) {
+      await ensureDirectoryPath(directory, 'QueueDirectories entry')
+    }
+  }
+
+  const stdoutPath = getAbsolutePlistPath(plist.StandardOutPath)
+
+  if (stdoutPath) {
+    await ensureFilePath(stdoutPath, 'StandardOutPath')
+  }
+
+  const stderrPath = getAbsolutePlistPath(plist.StandardErrorPath)
+
+  if (stderrPath) {
+    await ensureFilePath(stderrPath, 'StandardErrorPath')
+  }
+
+  for (const watchPath of toStringArray(plist.WatchPaths)) {
+    if (isAbsolute(watchPath)) {
+      await ensureDirectoryPath(dirname(watchPath), 'WatchPaths parent directory')
+    }
+  }
+}
+
+async function parseValidatedPlist(plistPath: string): Promise<Record<string, unknown>> {
+  await run('/usr/bin/plutil', ['-lint', plistPath])
+  return parsePlistJson(plistPath)
 }
 
 function formatBooleanFlag(value: unknown): string | null {
@@ -550,18 +715,79 @@ function buildPlistFields(
   ].filter((field): field is LaunchdPlistField => Boolean(field))
 }
 
-async function validatePlistFileContent(content: string): Promise<void> {
-  const tempDirectory = await mkdtemp(join(tmpdir(), 'launchcontrol-plist-'))
-  const tempPath = join(tempDirectory, 'candidate.plist')
+async function validatePlistFileContent(plistPath: string, content: string): Promise<void> {
+  const previousContent = await readFile(plistPath, 'utf8')
+  let wroteCandidate = false
 
   try {
-    await writeFile(tempPath, content, 'utf8')
-    await run('/usr/bin/plutil', ['-lint', tempPath])
+    await writeFile(plistPath, content, 'utf8')
+    wroteCandidate = true
+    const plist = await parseValidatedPlist(plistPath)
+    await ensurePlistFilesystemTargets(plist)
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    throw new Error(message.replace(/^Command failed:[^\n]*\n?/, '').trim() || 'Invalid plist content.')
+    let restoreFailureMessage = ''
+
+    if (wroteCandidate) {
+      try {
+        await writeFile(plistPath, previousContent, 'utf8')
+      } catch (restoreError) {
+        const restoreMessage =
+          restoreError instanceof Error ? restoreError.message : String(restoreError)
+        restoreFailureMessage = ` The previous plist content could not be restored: ${restoreMessage}`
+      }
+    }
+
+    const formattedMessage = formatPlistValidationMessage(error, 'Invalid plist content.')
+
+    throw new Error(`${formattedMessage}${restoreFailureMessage}`)
+  }
+}
+
+export async function createService(input: CreateLaunchdServiceInput): Promise<void> {
+  const label = assertValidServiceLabel(input.label)
+  const plistContent = input.plistContent.trim()
+
+  if (!plistContent) {
+    throw new Error('Plist content is required.')
+  }
+
+  await mkdir(launchAgentsDir, { recursive: true })
+
+  const plistPath = join(launchAgentsDir, `${label}.plist`)
+
+  try {
+    await access(plistPath, constants.F_OK)
+    throw new Error(`${basename(plistPath)} already exists in ~/Library/LaunchAgents.`)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error
+    }
+  }
+
+  const tempPlistPath = join(
+    launchAgentsDir,
+    `.${label}.${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 8)}.plist`
+  )
+
+  try {
+    await writeFile(tempPlistPath, input.plistContent, 'utf8')
+    const plist = await parseValidatedPlist(tempPlistPath)
+    const plistLabel = typeof plist.Label === 'string' ? plist.Label.trim() : ''
+
+    if (!plistLabel) {
+      throw new Error('Plist must include a Label key.')
+    }
+
+    if (plistLabel !== label) {
+      throw new Error(`Plist Label must match "${label}".`)
+    }
+
+    await ensurePlistFilesystemTargets(plist)
+    await rename(tempPlistPath, plistPath)
+  } catch (error) {
+    throw new Error(formatPlistValidationMessage(error, 'Invalid plist content.'))
   } finally {
-    await rm(tempDirectory, { recursive: true, force: true })
+    await rm(tempPlistPath, { force: true })
   }
 }
 
@@ -668,59 +894,42 @@ async function listLaunchAgentDefinitions(): Promise<LaunchAgentDefinition[]> {
 
 export async function listServices(
   aliases: Record<string, string>,
+  folders: Record<string, string>,
   automations: Record<string, ServiceAutomationSettings>
 ): Promise<LaunchdService[]> {
-  const [definitions, listOutput, disabledOutput] = await Promise.all([
+  const [definitions, runtimeSnapshots] = await Promise.all([
     listLaunchAgentDefinitions(),
-    runLaunchctl(['list']),
-    runLaunchctl(['print-disabled', userDomain])
+    collectRuntimeSnapshotBundle()
   ])
 
-  const runtimeMap = parseLaunchctlList(listOutput)
-  const disabledMap = parseDisabledMap(disabledOutput)
-  const sampledAt = new Date().toISOString()
-  const loadMap = await collectProcessLoadSnapshots(
-    [...runtimeMap.values()].flatMap((runtime) => (runtime.pid && runtime.pid > 0 ? [runtime.pid] : []))
-  ).catch(() => new Map<number, ServiceLoadSnapshot>())
-
   const services = definitions.map((definition) => {
-    const runtime = runtimeMap.get(definition.label)
-    const enabled = disabledMap.get(definition.label) ?? true
-    const pid = runtime?.pid ?? null
-
-    const base: Omit<LaunchdService, 'name' | 'alias' | 'automation'> = {
+    const baseService: LaunchdService = {
       label: definition.label,
       plistPath: definition.plistPath,
       plistName: definition.plistName,
       serviceInfo: definition.serviceInfo,
-      enabled,
-      loaded: runtime?.loaded ?? false,
-      running: runtime?.running ?? false,
-      pid,
-      lastExitStatus: runtime?.lastExitStatus ?? null,
-      status:
-        runtime?.running ?? false
-          ? 'running'
-          : runtime?.loaded
-            ? 'loaded'
-            : 'stopped',
+      enabled: true,
+      loaded: false,
+      running: false,
+      pid: null,
+      lastExitStatus: null,
+      status: 'stopped',
       logTargets: definition.logTargets,
-      load:
-        pid && pid > 0
-          ? loadMap.get(pid) ?? {
-              ...createEmptyLoadSnapshot(sampledAt),
-              cpuPercent: null,
-              residentMemoryBytes: null,
-              virtualMemoryBytes: null,
-              memoryPercent: null,
-              energyImpact: null,
-              threads: null,
-              state: null
-            }
-          : createEmptyLoadSnapshot(sampledAt)
+      load: createEmptyLoadSnapshot(runtimeSnapshots.sampledAt),
+      alias: null,
+      folder: null,
+      name: definition.label,
+      automation: {
+        startCondition: null,
+        automaticStartTimes: [],
+        startOnLaunch: false,
+        launchDelaySeconds: 0,
+        ensureRunning: false
+      }
     }
 
     const alias = aliases[definition.label]?.trim() || null
+    const folder = folders[definition.label]?.trim() || null
     const automation = automations[definition.label] ?? {
       startCondition: null,
       automaticStartTimes: [],
@@ -729,15 +938,29 @@ export async function listServices(
       ensureRunning: false
     }
 
-    return {
-      ...base,
-      alias,
-      name: alias ?? definition.label,
-      automation
-    }
+    return applyRuntimeSnapshotToService(
+      {
+        ...baseService,
+        alias,
+        folder,
+        name: alias ?? definition.label,
+        automation
+      },
+      runtimeSnapshots
+    )
   })
 
   return services
+}
+
+export async function refreshServiceRuntimeSnapshots(
+  services: LaunchdService[]
+): Promise<LaunchdService[]> {
+  const runtimeSnapshots = await collectRuntimeSnapshotBundle()
+
+  return services.map((service) =>
+    applyRuntimeSnapshotToService(service, runtimeSnapshots)
+  )
 }
 
 async function bootstrapService(service: LaunchdService): Promise<void> {
@@ -951,8 +1174,7 @@ export async function savePlistDocument(service: LaunchdService, content: string
     throw new Error('This service does not have a managed plist file.')
   }
 
-  await validatePlistFileContent(content)
-  await writeFile(service.plistPath, content, 'utf8')
+  await validatePlistFileContent(service.plistPath, content)
 }
 
 export async function readServiceSource(service: LaunchdService): Promise<ServiceSource> {

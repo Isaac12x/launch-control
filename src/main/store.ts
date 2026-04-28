@@ -8,6 +8,7 @@ import type {
 } from '../shared/types'
 
 type AliasMap = Record<string, string>
+type FolderMap = Record<string, string>
 type AutomationMap = Record<string, ServiceAutomationSettings>
 interface PreferenceState {
   loginItemPreferenceInitialized?: boolean
@@ -16,6 +17,10 @@ const timePattern = /^([01]\d|2[0-3]):([0-5]\d)$/
 
 function aliasesPath(): string {
   return join(app.getPath('userData'), 'aliases.json')
+}
+
+function foldersPath(): string {
+  return join(app.getPath('userData'), 'folders.json')
 }
 
 function automationPath(): string {
@@ -127,6 +132,28 @@ async function writeAliasFile(aliases: AliasMap): Promise<void> {
   await writeFile(filePath, JSON.stringify(aliases, null, 2), 'utf8')
 }
 
+async function readFolderFile(): Promise<FolderMap> {
+  const filePath = foldersPath()
+
+  try {
+    const raw = await readFile(filePath, 'utf8')
+    const parsed = JSON.parse(raw) as FolderMap
+    return parsed
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return {}
+    }
+
+    throw error
+  }
+}
+
+async function writeFolderFile(folders: FolderMap): Promise<void> {
+  const filePath = foldersPath()
+  await mkdir(dirname(filePath), { recursive: true })
+  await writeFile(filePath, JSON.stringify(folders, null, 2), 'utf8')
+}
+
 async function readPreferencesFile(): Promise<PreferenceState> {
   const filePath = preferencesPath()
 
@@ -182,6 +209,10 @@ export async function getAliases(): Promise<AliasMap> {
   return readAliasFile()
 }
 
+export async function getFolders(): Promise<FolderMap> {
+  return readFolderFile()
+}
+
 export async function getAutomationSettings(): Promise<AutomationMap> {
   return readAutomationFile()
 }
@@ -223,6 +254,22 @@ export async function setAliases(updates: Record<string, string | null>): Promis
   }
 
   await writeAliasFile(aliases)
+}
+
+export async function setFolders(updates: Record<string, string | null>): Promise<void> {
+  const folders = await readFolderFile()
+
+  for (const [label, folder] of Object.entries(updates)) {
+    const nextFolder = typeof folder === 'string' ? folder.trim() : ''
+
+    if (nextFolder) {
+      folders[label] = nextFolder
+    } else {
+      delete folders[label]
+    }
+  }
+
+  await writeFolderFile(folders)
 }
 
 export async function setAutomationSettings(
