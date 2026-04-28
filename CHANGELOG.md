@@ -23,5 +23,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Cleared npm audit findings by upgrading Electron, Vite, the React Vite plugin, electron-vite, and the transitive @xmldom/xmldom lock entry.
 - Corrected virtual memory unit conversion for process snapshots.
 - Guarded terminal input and resize handling after embedded sessions exit.
