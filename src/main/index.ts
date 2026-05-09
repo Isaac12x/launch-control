@@ -1,5 +1,5 @@
-import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage } from 'electron'
-import type { NativeImage } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, Tray, nativeImage } from 'electron'
+import type { NativeImage, OpenDialogOptions } from 'electron'
 import { join } from 'node:path'
 import type {
   CreateLaunchdServiceInput,
@@ -13,6 +13,7 @@ import type {
 import { startAutomationCoordinator, type AutomationCoordinator } from './automation'
 import {
   createService,
+  createRepositoryServiceDraft,
   listServices,
   openGhostty,
   performAction,
@@ -324,6 +325,24 @@ app.whenReady().then(async () => {
   ipcMain.handle('launchd:create', async (_event, input: CreateLaunchdServiceInput) => {
     await createService(input)
     return refreshServices()
+  })
+
+  ipcMain.handle('launchd:repository:select', async (event) => {
+    const window = BrowserWindow.fromWebContents(event.sender) ?? mainWindow
+    const options: OpenDialogOptions = {
+      title: 'Select repository',
+      buttonLabel: 'Use repository',
+      properties: ['openDirectory']
+    }
+    const result = window
+      ? await dialog.showOpenDialog(window, options)
+      : await dialog.showOpenDialog(options)
+
+    if (result.canceled || result.filePaths.length === 0) {
+      return null
+    }
+
+    return createRepositoryServiceDraft(result.filePaths[0])
   })
 
   ipcMain.handle('launchd:rename', async (_event, label: string, alias: string) => {

@@ -5,6 +5,7 @@ const pollIntervalMs = 15_000
 interface ServiceRuntimeSnapshot {
   loaded: boolean
   running: boolean
+  completed: boolean
 }
 
 interface PendingDependencyStart {
@@ -34,7 +35,8 @@ function toSnapshotMap(services: LaunchdService[]): Map<string, ServiceRuntimeSn
       service.label,
       {
         loaded: service.loaded,
-        running: service.running
+        running: service.running,
+        completed: service.completed
       }
     ])
   )
@@ -48,11 +50,11 @@ function doesSnapshotMeetCondition(
     return false
   }
 
-  return waitFor === 'loaded' ? snapshot.loaded : snapshot.running
+  return waitFor === 'loaded' ? snapshot.loaded : snapshot.running || snapshot.completed
 }
 
 function doesServiceMeetCondition(service: LaunchdService, waitFor: StartConditionState): boolean {
-  return waitFor === 'loaded' ? service.loaded : service.running
+  return waitFor === 'loaded' ? service.loaded : service.running || service.completed
 }
 
 export function getServiceStartBlocker(
@@ -105,7 +107,7 @@ function getMinuteStamp(date: Date): string {
 }
 
 function isStartable(service: LaunchdService): boolean {
-  return service.enabled && !service.running
+  return service.enabled && !service.running && !service.completed
 }
 
 export function startAutomationCoordinator(
@@ -149,7 +151,7 @@ export function startAutomationCoordinator(
         continue
       }
 
-      if (service.running) {
+      if (service.running || service.completed) {
         completedLaunchStarts.add(service.label)
         continue
       }
@@ -165,7 +167,7 @@ export function startAutomationCoordinator(
 
       const refreshedService = services.find((candidate) => candidate.label === service.label)
 
-      if (result.started || refreshedService?.running) {
+      if (result.started || refreshedService?.running || refreshedService?.completed) {
         completedLaunchStarts.add(service.label)
       }
     }

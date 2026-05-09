@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.0.2] - 2026-05-09
+
+### Added
+
+- Added repository-assisted service registration with folder selection, run-command detection, and generated automatic launch plist settings.
+
+### Changed
+
+- Restart now unloads and bootstraps launchd jobs before kickstarting so failed starts can be retried from a fresh launchd state.
+- Start and restart actions clear stale failure guidance as soon as a new attempt begins.
+
+### Fixed
+
+- Gave the log tail more room on the launch failure page by making troubleshooting guidance more compact and scrollable.
+
 ## [1.0.1] - 2026-04-29
 
 ### Added
