@@ -5,6 +5,7 @@ const api: LaunchdApi = {
   listServices: () => ipcRenderer.invoke('launchd:list'),
   refreshLiveServices: () => ipcRenderer.invoke('launchd:list-live'),
   createService: (input) => ipcRenderer.invoke('launchd:create', input),
+  selectRepositoryForService: () => ipcRenderer.invoke('launchd:repository:select'),
   renameService: (label, alias) => ipcRenderer.invoke('launchd:rename', label, alias),
   clearAlias: (label) => ipcRenderer.invoke('launchd:clear-alias', label),
   moveServicesToFolder: (labels, folderPath) =>

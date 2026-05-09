@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { access, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join } from 'node:path'
@@ -11,6 +11,8 @@ import type {
   LaunchdPlistField,
   LaunchdTerminalMode,
   LaunchdService,
+  RepositoryLaunchdDraft,
+  RepositoryRunCommandOption,
   ServiceLoadSnapshot,
   ServiceAutomationSettings,
   ServiceLogFile,
@@ -28,6 +30,17 @@ const userDomain = `gui/${uid}`
 const launchAgentsDir = join(homedir(), 'Library', 'LaunchAgents')
 const logLineCount = 300
 const serviceLabelPattern = /^[A-Za-z0-9._-]+$/
+const repositoryLabelPrefix = 'com.launchcontrol.repo'
+const shellSafeWordPattern = /^[A-Za-z0-9_./:@+-]+$/
+const preferredPackageScripts = ['start', 'serve', 'dev', 'preview']
+const preferredMakeTargets = ['start', 'run', 'serve', 'dev']
+
+type PackageManager = 'npm' | 'pnpm' | 'yarn' | 'bun'
+
+interface PackageJsonMetadata {
+  scripts: Record<string, string>
+  packageManager: string | null
+}
 
 interface RuntimeState {
   loaded: boolean
@@ -41,6 +54,8 @@ interface LaunchAgentDefinition {
   plistPath: string
   plistName: string
   serviceInfo: string | null
+  runAtLoad: boolean
+  keepAlive: boolean
   logTargets: ServiceLogTarget[]
 }
 
@@ -75,6 +90,275 @@ function toStringArray(value: unknown): string[] {
   return value
     .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
     .map((entry) => entry.trim())
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path, constants.F_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function normalizeRepositoryLabelPart(value: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^[.-]+|[.-]+$/g, '')
+    .replace(/[.-]{2,}/g, '-')
+
+  return normalized || 'service'
+}
+
+function createRepositoryServiceLabel(repositoryPath: string): string {
+  return `${repositoryLabelPrefix}.${normalizeRepositoryLabelPart(basename(repositoryPath))}`
+}
+
+function shellQuote(value: string): string {
+  if (shellSafeWordPattern.test(value)) {
+    return value
+  }
+
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+function createShellCommand(command: string): string {
+  return `exec ${command}`
+}
+
+function normalizePackageScripts(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {}
+  }
+
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      (entry): entry is [string, string] => typeof entry[1] === 'string' && entry[1].trim().length > 0
+    )
+  )
+}
+
+async function readPackageJsonMetadata(repositoryPath: string): Promise<PackageJsonMetadata | null> {
+  const packageJsonPath = join(repositoryPath, 'package.json')
+
+  if (!(await pathExists(packageJsonPath))) {
+    return null
+  }
+
+  const parsed = JSON.parse(await readFile(packageJsonPath, 'utf8')) as {
+    scripts?: unknown
+    packageManager?: unknown
+  }
+
+  return {
+    scripts: normalizePackageScripts(parsed.scripts),
+    packageManager: typeof parsed.packageManager === 'string' ? parsed.packageManager : null
+  }
+}
+
+async function detectPackageManager(
+  repositoryPath: string,
+  metadata: PackageJsonMetadata
+): Promise<PackageManager> {
+  const declaredManager = metadata.packageManager?.split('@')[0]
+
+  if (
+    declaredManager === 'npm' ||
+    declaredManager === 'pnpm' ||
+    declaredManager === 'yarn' ||
+    declaredManager === 'bun'
+  ) {
+    return declaredManager
+  }
+
+  if (await pathExists(join(repositoryPath, 'pnpm-lock.yaml'))) {
+    return 'pnpm'
+  }
+
+  if (await pathExists(join(repositoryPath, 'yarn.lock'))) {
+    return 'yarn'
+  }
+
+  if (
+    (await pathExists(join(repositoryPath, 'bun.lock'))) ||
+    (await pathExists(join(repositoryPath, 'bun.lockb')))
+  ) {
+    return 'bun'
+  }
+
+  return 'npm'
+}
+
+function formatPackageScriptCommand(packageManager: PackageManager, scriptName: string): string {
+  return createShellCommand(
+    `/usr/bin/env ${packageManager} run ${shellQuote(scriptName)}`
+  )
+}
+
+function sortPackageScriptNames(scriptNames: string[]): string[] {
+  return [...scriptNames].sort((left, right) => {
+    const leftPreferredIndex = preferredPackageScripts.indexOf(left)
+    const rightPreferredIndex = preferredPackageScripts.indexOf(right)
+
+    if (leftPreferredIndex !== -1 || rightPreferredIndex !== -1) {
+      if (leftPreferredIndex === -1) {
+        return 1
+      }
+
+      if (rightPreferredIndex === -1) {
+        return -1
+      }
+
+      return leftPreferredIndex - rightPreferredIndex
+    }
+
+    return left.localeCompare(right)
+  })
+}
+
+async function createPackageRunCommandOptions(
+  repositoryPath: string
+): Promise<RepositoryRunCommandOption[]> {
+  const metadata = await readPackageJsonMetadata(repositoryPath)
+
+  if (!metadata) {
+    return []
+  }
+
+  const packageManager = await detectPackageManager(repositoryPath, metadata)
+
+  return sortPackageScriptNames(Object.keys(metadata.scripts)).map((scriptName) => ({
+    id: `package:${scriptName}`,
+    label: `${packageManager} run ${scriptName}`,
+    command: formatPackageScriptCommand(packageManager, scriptName),
+    detail: `package.json script: ${metadata.scripts[scriptName]}`
+  }))
+}
+
+function getMakeTargetNames(content: string): string[] {
+  const targets = new Set<string>()
+  const targetPattern = /^([A-Za-z0-9_.-]+)\s*:(?![=])/gm
+  let match: RegExpExecArray | null
+
+  while ((match = targetPattern.exec(content))) {
+    const targetName = match[1]
+
+    if (!targetName.startsWith('.')) {
+      targets.add(targetName)
+    }
+  }
+
+  return [...targets]
+}
+
+async function createMakeRunCommandOptions(
+  repositoryPath: string
+): Promise<RepositoryRunCommandOption[]> {
+  const makefilePath = join(repositoryPath, 'Makefile')
+
+  if (!(await pathExists(makefilePath))) {
+    return []
+  }
+
+  const targetNames = getMakeTargetNames(await readFile(makefilePath, 'utf8')).filter((targetName) =>
+    preferredMakeTargets.includes(targetName)
+  )
+
+  return preferredMakeTargets
+    .filter((targetName) => targetNames.includes(targetName))
+    .map((targetName) => ({
+      id: `make:${targetName}`,
+      label: `make ${targetName}`,
+      command: createShellCommand(`/usr/bin/env make ${shellQuote(targetName)}`),
+      detail: `Makefile target: ${targetName}`
+    }))
+}
+
+async function createProcfileRunCommandOptions(
+  repositoryPath: string
+): Promise<RepositoryRunCommandOption[]> {
+  const procfilePath = join(repositoryPath, 'Procfile')
+
+  if (!(await pathExists(procfilePath))) {
+    return []
+  }
+
+  const lines = (await readFile(procfilePath, 'utf8'))
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'))
+
+  return lines.flatMap((line) => {
+    const separatorIndex = line.indexOf(':')
+
+    if (separatorIndex === -1) {
+      return []
+    }
+
+    const processName = line.slice(0, separatorIndex).trim()
+    const command = line.slice(separatorIndex + 1).trim()
+
+    if (!processName || !command) {
+      return []
+    }
+
+    return [
+      {
+        id: `procfile:${processName}`,
+        label: `Procfile ${processName}`,
+        command: createShellCommand(command),
+        detail: `Procfile entry: ${processName}`
+      }
+    ]
+  })
+}
+
+async function createLanguageRunCommandOptions(
+  repositoryPath: string
+): Promise<RepositoryRunCommandOption[]> {
+  const options: RepositoryRunCommandOption[] = []
+
+  if (await pathExists(join(repositoryPath, 'Cargo.toml'))) {
+    options.push({
+      id: 'cargo:run',
+      label: 'cargo run',
+      command: createShellCommand('/usr/bin/env cargo run'),
+      detail: 'Cargo project'
+    })
+  }
+
+  if (await pathExists(join(repositoryPath, 'go.mod'))) {
+    options.push({
+      id: 'go:run',
+      label: 'go run .',
+      command: createShellCommand('/usr/bin/env go run .'),
+      detail: 'Go module'
+    })
+  }
+
+  return options
+}
+
+async function createRepositoryRunCommandOptions(
+  repositoryPath: string
+): Promise<RepositoryRunCommandOption[]> {
+  const optionGroups = await Promise.all([
+    createPackageRunCommandOptions(repositoryPath),
+    createProcfileRunCommandOptions(repositoryPath),
+    createMakeRunCommandOptions(repositoryPath),
+    createLanguageRunCommandOptions(repositoryPath)
+  ])
+  const optionsByCommand = new Map<string, RepositoryRunCommandOption>()
+
+  for (const option of optionGroups.flat()) {
+    if (!optionsByCommand.has(option.command)) {
+      optionsByCommand.set(option.command, option)
+    }
+  }
+
+  return [...optionsByCommand.values()]
 }
 
 function formatLaunchSchedule(plist: Record<string, unknown>): string | null {
@@ -509,20 +793,25 @@ function applyRuntimeSnapshotToService(
   const runtime = snapshots.runtimeMap.get(service.label)
   const enabled = snapshots.disabledMap.get(service.label) ?? true
   const pid = runtime?.pid ?? null
+  const loaded = runtime?.loaded ?? false
+  const running = runtime?.running ?? false
+  const lastExitStatus = runtime?.lastExitStatus ?? null
+  const completed =
+    !running &&
+    loaded &&
+    lastExitStatus === 0 &&
+    service.runAtLoad &&
+    !service.keepAlive
 
   return {
     ...service,
     enabled,
-    loaded: runtime?.loaded ?? false,
-    running: runtime?.running ?? false,
+    loaded,
+    running,
+    completed,
     pid,
-    lastExitStatus: runtime?.lastExitStatus ?? null,
-    status:
-      runtime?.running ?? false
-        ? 'running'
-        : runtime?.loaded
-          ? 'loaded'
-          : 'stopped',
+    lastExitStatus,
+    status: running ? 'running' : completed ? 'completed' : loaded ? 'loaded' : 'stopped',
     load: buildServiceLoadSnapshot(pid, snapshots.loadMap, snapshots.sampledAt)
   }
 }
@@ -682,6 +971,12 @@ function formatKeepAlive(value: unknown): string | null {
   return null
 }
 
+function hasKeepAlive(plist: Record<string, unknown>): boolean {
+  const keepAlive = plist.KeepAlive
+
+  return keepAlive === true || Boolean(keepAlive && typeof keepAlive === 'object')
+}
+
 function createLaunchdField(
   key: string,
   value: string | null,
@@ -740,6 +1035,30 @@ async function validatePlistFileContent(plistPath: string, content: string): Pro
     const formattedMessage = formatPlistValidationMessage(error, 'Invalid plist content.')
 
     throw new Error(`${formattedMessage}${restoreFailureMessage}`)
+  }
+}
+
+export async function createRepositoryServiceDraft(
+  repositoryPath: string
+): Promise<RepositoryLaunchdDraft> {
+  const repositoryStats = await stat(repositoryPath)
+
+  if (!repositoryStats.isDirectory()) {
+    throw new Error('Select a repository directory.')
+  }
+
+  const runCommandOptions = await createRepositoryRunCommandOptions(repositoryPath)
+  const preferredOption = runCommandOptions[0] ?? null
+
+  return {
+    repositoryPath,
+    repositoryName: basename(repositoryPath),
+    label: createRepositoryServiceLabel(repositoryPath),
+    runCommand: preferredOption?.command ?? '',
+    runCommandSource:
+      preferredOption?.detail ??
+      'No standard run command was detected. Enter the command LaunchControl should run from this repository.',
+    runCommandOptions
   }
 }
 
@@ -825,7 +1144,9 @@ function mergeDefinitions(
     plistPath: preferred.plistPath,
     plistName: preferred.plistName,
     serviceInfo: preferred.serviceInfo ?? secondary.serviceInfo,
-    logTargets: mergeLogTargets(preferred.logTargets, secondary.logTargets)
+    logTargets: mergeLogTargets(preferred.logTargets, secondary.logTargets),
+    runAtLoad: preferred.runAtLoad || secondary.runAtLoad,
+    keepAlive: preferred.keepAlive || secondary.keepAlive
   }
 }
 
@@ -843,12 +1164,16 @@ async function listLaunchAgentDefinitions(): Promise<LaunchAgentDefinition[]> {
         let plistName = fileName
         let label = basename(fileName, '.plist')
         let serviceInfo: string | null = null
+        let runAtLoad = false
+        let keepAlive = false
 
         try {
           const plist = await parsePlistJson(plistPath)
           label = String(plist.Label ?? label)
           plistName = basename(plistPath)
           serviceInfo = summarizePlist(plist)
+          runAtLoad = plist.RunAtLoad === true
+          keepAlive = hasKeepAlive(plist)
           const stdoutPath = plist.StandardOutPath
           const stderrPath = plist.StandardErrorPath
 
@@ -868,6 +1193,8 @@ async function listLaunchAgentDefinitions(): Promise<LaunchAgentDefinition[]> {
           plistPath,
           plistName,
           serviceInfo,
+          runAtLoad,
+          keepAlive,
           logTargets
         }
       })
@@ -911,9 +1238,12 @@ export async function listServices(
       enabled: true,
       loaded: false,
       running: false,
+      completed: false,
       pid: null,
       lastExitStatus: null,
       status: 'stopped',
+      runAtLoad: definition.runAtLoad,
+      keepAlive: definition.keepAlive,
       logTargets: definition.logTargets,
       load: createEmptyLoadSnapshot(runtimeSnapshots.sampledAt),
       alias: null,
@@ -983,6 +1313,27 @@ async function kickstartService(label: string): Promise<void> {
   await runLaunchctl(['kickstart', '-k', `${userDomain}/${label}`])
 }
 
+async function unloadService(service: LaunchdService): Promise<void> {
+  if (service.plistPath) {
+    await runLaunchctl(['bootout', userDomain, service.plistPath])
+    return
+  }
+
+  await runLaunchctl(['bootout', `${userDomain}/${service.label}`])
+}
+
+async function unloadServiceIfLoaded(service: LaunchdService): Promise<void> {
+  if (!service.loaded) {
+    return
+  }
+
+  try {
+    await unloadService(service)
+  } catch {
+    // A failed start can leave launchd's reported state stale; continue with a clean bootstrap attempt.
+  }
+}
+
 async function resetServiceEnablement(service: LaunchdService): Promise<void> {
   await runLaunchctl(['disable', `${userDomain}/${service.label}`])
   await runLaunchctl(['enable', `${userDomain}/${service.label}`])
@@ -994,6 +1345,7 @@ async function startService(service: LaunchdService, retriedAfterBootstrapIoErro
   }
 
   try {
+    await unloadServiceIfLoaded(service)
     await bootstrapService(service)
     await kickstartService(service.label)
   } catch (error) {
@@ -1007,21 +1359,12 @@ async function startService(service: LaunchdService, retriedAfterBootstrapIoErro
 }
 
 async function stopService(service: LaunchdService): Promise<void> {
-  if (service.plistPath) {
-    await runLaunchctl(['bootout', userDomain, service.plistPath])
-    return
-  }
-
-  await runLaunchctl(['bootout', `${userDomain}/${service.label}`])
+  await unloadService(service)
 }
 
 async function restartService(service: LaunchdService): Promise<void> {
-  if (!service.loaded) {
-    await startService(service)
-    return
-  }
-
-  await kickstartService(service.label)
+  await unloadServiceIfLoaded(service)
+  await startService({ ...service, loaded: false })
 }
 
 async function enableService(service: LaunchdService): Promise<void> {

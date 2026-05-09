@@ -80,6 +80,22 @@ export interface CreateLaunchdServiceInput {
   plistContent: string
 }
 
+export interface RepositoryRunCommandOption {
+  id: string
+  label: string
+  command: string
+  detail: string
+}
+
+export interface RepositoryLaunchdDraft {
+  repositoryPath: string
+  repositoryName: string
+  label: string
+  runCommand: string
+  runCommandSource: string
+  runCommandOptions: RepositoryRunCommandOption[]
+}
+
 export interface ServiceStartCondition {
   afterLabel: string
   waitFor: StartConditionState
@@ -119,9 +135,12 @@ export interface LaunchdService {
   enabled: boolean
   loaded: boolean
   running: boolean
+  completed: boolean
   pid: number | null
   lastExitStatus: number | null
-  status: 'running' | 'loaded' | 'stopped'
+  status: 'running' | 'completed' | 'loaded' | 'stopped'
+  runAtLoad: boolean
+  keepAlive: boolean
   logTargets: ServiceLogTarget[]
   automation: ServiceAutomationSettings
   load: ServiceLoadSnapshot
@@ -131,6 +150,7 @@ export interface LaunchdApi {
   listServices: () => Promise<LaunchdService[]>
   refreshLiveServices: () => Promise<LaunchdService[]>
   createService: (input: CreateLaunchdServiceInput) => Promise<LaunchdService[]>
+  selectRepositoryForService: () => Promise<RepositoryLaunchdDraft | null>
   renameService: (label: string, alias: string) => Promise<LaunchdService[]>
   clearAlias: (label: string) => Promise<LaunchdService[]>
   moveServicesToFolder: (labels: string[], folderPath: string) => Promise<LaunchdService[]>
