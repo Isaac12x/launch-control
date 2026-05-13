@@ -1130,6 +1130,10 @@ button {
   background: var(--success);
 }
 
+.tree-row__status.is-progress {
+  background: var(--accent-strong);
+}
+
 .tree-row__status.is-completed {
   background: color-mix(in oklch, var(--success) 72%, white);
 }

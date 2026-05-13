@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-05-13
+
+### Changed
+
+- Refreshed the app icon assets used for packaged macOS builds.
+- Updated the bundled Ghostty archive used by release packaging.
+- Ignored the generated `codedb.snapshot` index in future commits.
+
+### Fixed
+
+- Quoted repository paths in generated service run commands so spaces and apostrophes work.
+- Kept live service refreshes from replacing stable service metadata while still updating runtime state.
+- Showed in-progress service feedback in the service tree during start, stop, and restart actions.
+
 ## [1.0.2] - 2026-05-09
 
 ### Added
