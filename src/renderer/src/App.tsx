@@ -49,6 +49,8 @@ import type {
   TerminalExitEvent,
   TerminalSessionInfo
 } from '@shared/types'
+import { getTreeServiceDisplayState, mergeLiveRuntimeServices } from './liveRuntime'
+import { buildRepositoryRunShellCommand } from './repositoryTemplate'
 
 type LogKind = 'stdout' | 'stderr'
 type CardFeedbackTone = 'neutral' | 'progress' | 'success' | 'error'
@@ -505,9 +507,7 @@ function buildRepositoryServiceTemplate({
   keepAlive: boolean
 }): string {
   const normalizedLabel = normalizeServiceLabelInput(label) || defaultCreateServiceLabel
-  const command =
-    runCommand.trim() ||
-    'echo "Set the repository run command before starting this service."'
+  const command = buildRepositoryRunShellCommand(repositoryPath, runCommand)
   const runAtLoadBlock = runAtLoad
     ? `
   <key>RunAtLoad</key>
@@ -1737,7 +1737,18 @@ export default function App(): JSX.Element {
     liveRefreshBusyRef.current = true
 
     try {
-      scheduleBackgroundServiceUsageUpdate(await window.launchdControl.refreshLiveServices())
+      const refreshedServices = await window.launchdControl.refreshLiveServices()
+
+      scheduleBackgroundServiceUsageUpdate(refreshedServices)
+      startTransition(() => {
+        setServices((currentServices) => {
+          const merged = mergeLiveRuntimeServices(currentServices, refreshedServices)
+
+          return merged.changed
+            ? sortServices(merged.services, serviceSortRef.current, getServiceLoadForSort)
+            : currentServices
+        })
+      })
     } catch {
       // Silent live refresh failures should not replace the current UI state.
     } finally {
@@ -2846,6 +2857,7 @@ export default function App(): JSX.Element {
                         draggedLabels={treeDraggedLabels}
                         dropTargetPath={treeDropTargetPath}
                         expandedFolders={expandedFolders}
+                        feedbacks={cardFeedbacks}
                         nodes={serviceTree}
                         onDragEnd={endTreeServiceDrag}
                         onDragServiceStart={startTreeServiceDrag}
@@ -4401,6 +4413,7 @@ function ServiceTree({
   draggedLabels,
   dropTargetPath,
   expandedFolders,
+  feedbacks,
   selectedLabels,
   selectionBusy,
   servicesByLabel,
@@ -4420,6 +4433,7 @@ function ServiceTree({
   draggedLabels: string[]
   dropTargetPath: string | null
   expandedFolders: Record<string, boolean>
+  feedbacks: Record<string, CardFeedback>
   selectedLabels: string[]
   selectionBusy: boolean
   servicesByLabel: Record<string, LaunchdService>
@@ -4584,6 +4598,7 @@ function ServiceTree({
                   draggedLabels={draggedLabels}
                   dropTargetPath={dropTargetPath}
                   expandedFolders={expandedFolders}
+                  feedbacks={feedbacks}
                   level={level + 1}
                   nodes={node.children}
                   onDragEnd={onDragEnd}
@@ -4606,6 +4621,17 @@ function ServiceTree({
 
         const isSelected = selectedSet.has(node.service.label)
         const isDragging = draggedSet.has(node.service.label)
+        const displayState = getTreeServiceDisplayState(
+          node.service,
+          feedbacks[node.service.label] ?? null
+        )
+        const serviceMeta = isDragging
+          ? 'dragging'
+          : displayState.statusClass === 'progress'
+            ? displayState.label
+            : isSelected
+              ? 'selected'
+              : displayState.label
         const handleServiceClick = (): void => onSelect(node.service.label)
         const handleServiceDragStart = (event: DragEvent<HTMLDivElement>): void => {
           if (selectionBusy) {
@@ -4649,14 +4675,12 @@ function ServiceTree({
               >
                 {isSelected ? <Check /> : <Square />}
               </button>
-              <span className={`tree-row__status is-${node.service.status}`} />
+              <span className={`tree-row__status is-${displayState.statusClass}`} />
               <span className="tree-row__icon">
                 <FileText />
               </span>
               <span className="tree-row__label">{node.leafName}</span>
-              <span className="tree-row__meta">
-                {isDragging ? 'dragging' : isSelected ? 'selected' : node.service.status}
-              </span>
+              <span className="tree-row__meta">{serviceMeta}</span>
             </div>
           </li>
         )
