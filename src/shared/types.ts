@@ -6,7 +6,8 @@ export type LaunchdAction =
   | 'disable'
   | 'delete'
 
-export type LaunchdTerminalMode = 'service' | 'logs'
+export type LogKind = 'stdout' | 'stderr'
+export type LaunchdTerminalMode = 'service' | 'logs' | LogKind
 export type LaunchdGhosttyMode = LaunchdTerminalMode
 export type StartConditionState = 'loaded' | 'running'
 

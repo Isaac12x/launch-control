@@ -756,6 +756,8 @@ button {
 }
 
 .service-region {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
   min-height: 0;
   min-width: 0;
   overflow: auto;
@@ -2262,6 +2264,14 @@ button {
   box-shadow: var(--shadow);
 }
 
+.terminal-panel--log {
+  grid-template-rows: minmax(0, 1fr);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
 .terminal-panel__header {
   display: flex;
   align-items: start;
@@ -2339,6 +2349,7 @@ button {
 }
 
 .terminal-panel__viewport {
+  position: relative;
   min-height: 0;
   overflow: hidden;
   border: 1px solid var(--terminal-line);
@@ -2347,9 +2358,29 @@ button {
     radial-gradient(circle at top right, oklch(0.29 0.05 56 / 0.35), transparent 38%);
 }
 
+.terminal-panel--log .terminal-panel__viewport {
+  height: 100%;
+}
+
+.terminal-panel__log-actions {
+  position: absolute;
+  top: 0.7rem;
+  right: 0.7rem;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.terminal-panel__log-actions .terminal-panel__status,
+.terminal-panel__log-actions .ghost-button {
+  backdrop-filter: blur(8px);
+  background: oklch(0.99 0.01 82 / 0.86);
+}
+
 .terminal-panel__host {
   height: 100%;
-  min-height: 26rem;
+  min-height: 0;
   padding: 1rem 0.75rem 0.85rem 1rem;
 }
 
