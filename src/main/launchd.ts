@@ -1400,6 +1400,18 @@ async function deleteService(service: LaunchdService): Promise<void> {
   await removeAlias(service.label)
 }
 
+async function clearServiceLogFiles(service: LaunchdService): Promise<void> {
+  await Promise.all(
+    service.logTargets.map(async (target) => {
+      try {
+        await writeFile(target.path, '', 'utf8')
+      } catch {
+        // Missing or unwritable logs should not block the launchd action itself.
+      }
+    })
+  )
+}
+
 export async function performAction(
   services: LaunchdService[],
   label: string,
@@ -1420,12 +1432,14 @@ export async function performAction(
           throw new Error(blocker)
         }
       }
+      await clearServiceLogFiles(service)
       await startService(service)
       break
     case 'stop':
       await stopService(service)
       break
     case 'restart':
+      await clearServiceLogFiles(service)
       await restartService(service)
       break
     case 'enable':
@@ -1553,16 +1567,33 @@ export async function readServiceSource(service: LaunchdService): Promise<Servic
   }
 }
 
+function quoteTerminalPath(path: string): string {
+  return `'${path.replace(/'/g, `'\\''`)}'`
+}
+
+function getTerminalLogTargets(service: LaunchdService, mode: LaunchdTerminalMode): ServiceLogTarget[] {
+  if (mode === 'stdout' || mode === 'stderr') {
+    return service.logTargets.filter((target) => target.kind === mode)
+  }
+
+  return mode === 'logs' ? service.logTargets : []
+}
+
 function buildGhosttyCommand(service: LaunchdService, mode: LaunchdTerminalMode): string {
   const commandParts = [
     `printf '\\nLaunchControl\\n'`,
     `printf 'Service: ${service.label}\\n\\n'`
   ]
+  const logTargets = getTerminalLogTargets(service, mode)
 
-  if (mode === 'logs' && service.logTargets.length > 0) {
-    const quotedPaths = service.logTargets.map((target) => `'${target.path.replace(/'/g, `'\\''`)}'`)
-    commandParts.push(`tail -n 120 -f ${quotedPaths.join(' ')}`)
+  if (logTargets.length > 0) {
+    const quotedPaths = logTargets.map((target) => quoteTerminalPath(target.path))
+    commandParts.push(`printf 'Tailing ${mode === 'stdout' ? 'stdout' : mode === 'stderr' ? 'stderr' : 'declared logs'} with: tail -n 300 -F ${quotedPaths.join(' ')}\\n\\n'`)
+    commandParts.push(`tail -n 300 -F ${quotedPaths.join(' ')}`)
   } else {
+    if (mode === 'stdout' || mode === 'stderr' || mode === 'logs') {
+      commandParts.push(`printf 'No ${mode === 'logs' ? 'declared log targets' : mode} log target is declared for this service.\\n\\n'`)
+    }
     commandParts.push(`launchctl print ${userDomain}/${service.label}`)
     commandParts.push(`printf '\\nSuggested commands:\\n'`)
     commandParts.push(`printf '  launchctl kickstart -k ${userDomain}/${service.label}\\n'`)

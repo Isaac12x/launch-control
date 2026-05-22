@@ -104,6 +104,7 @@ interface TerminalPanelState {
   session: TerminalSessionInfo
   serviceLabel: string
   terminalMode: LaunchdTerminalMode
+  failure?: ServiceActionFailure | null
 }
 
 type ContentPanelState =
@@ -1193,10 +1194,26 @@ function buildLogPanel(
 }
 
 function getTerminalHeading(mode: LaunchdTerminalMode): string {
+  if (mode === 'stdout') {
+    return 'Live output terminal'
+  }
+
+  if (mode === 'stderr') {
+    return 'Live error terminal'
+  }
+
   return mode === 'logs' ? 'Live logs terminal' : 'Interactive terminal'
 }
 
 function getTerminalSummary(mode: LaunchdTerminalMode): string {
+  if (mode === 'stdout') {
+    return 'PTY session running tail -F for stdout.'
+  }
+
+  if (mode === 'stderr') {
+    return 'PTY session running tail -F for stderr.'
+  }
+
   return mode === 'logs'
     ? 'PTY session running the log tail command inside the app.'
     : 'PTY session attached to an interactive shell inside the app.'
@@ -1625,7 +1642,7 @@ export default function App(): JSX.Element {
         : null
   const terminalMode: LaunchdTerminalMode =
     contentPanel.mode === 'log'
-      ? 'logs'
+      ? contentPanel.kind
       : contentPanel.mode === 'terminal'
         ? contentPanel.terminalMode
         : 'service'
@@ -2468,14 +2485,30 @@ export default function App(): JSX.Element {
         setCardFeedback(label, { tone: 'success', message: `${getActionDone(action)}.` })
       }
 
-      if (contentPanel.mode === 'log' && contentPanel.serviceLabel === label) {
+      if (
+        (contentPanel.mode === 'log' || contentPanel.mode === 'terminal') &&
+        contentPanel.serviceLabel === label
+      ) {
         if (!nextService) {
           setContentPanel(servicesPanel)
-        } else {
+        } else if (contentPanel.mode === 'log') {
           try {
-            await refreshVisibleLog(label, contentPanel.kind, null)
+            await openLogTerminal(label, contentPanel.kind, null)
           } catch {
-            // Keep the successful action feedback even if the log pane cannot refresh.
+            // Keep the successful action feedback even if the log tail cannot reopen.
+          }
+        } else if (
+          action === 'start' ||
+          action === 'restart'
+        ) {
+          const currentMode = contentPanel.terminalMode
+
+          if (currentMode === 'stdout' || currentMode === 'stderr') {
+            try {
+              await openLogTerminal(label, currentMode, null)
+            } catch {
+              // The launch action succeeded; leave any terminal error as card feedback only.
+            }
           }
         }
       }
@@ -2489,10 +2522,10 @@ export default function App(): JSX.Element {
         try {
           const nextLogs = await window.launchdControl.readLogs(label)
           const failureKind = getPreferredFailureLogKind(currentService, nextLogs)
-          setContentPanel(buildLogPanel(nextLogs, failureKind, failure))
+          await openLogTerminal(label, failureKind, failure)
           setCardFeedback(label, {
             tone: 'error',
-            message: `${actionLabel} failed. Review ${getLogButtonLabel(failureKind)} for details.`
+            message: `${actionLabel} failed. Live ${getLogButtonLabel(failureKind)} tail opened.`
           })
         } catch {
           setCardFeedback(label, { tone: 'error', message: `${actionLabel} failed: ${message}` })
@@ -2606,28 +2639,43 @@ export default function App(): JSX.Element {
     }
   }
 
+  async function openLogTerminal(
+    label: string,
+    kind: LogKind,
+    failure: ServiceActionFailure | null = null
+  ): Promise<TerminalSessionInfo> {
+    if (contentPanel.mode === 'terminal') {
+      await closeEmbeddedTerminal(contentPanel.session.id)
+    }
+
+    const session = await window.launchdControl.openTerminal(label, kind)
+    setContentPanel({
+      mode: 'terminal',
+      session,
+      serviceLabel: label,
+      terminalMode: kind,
+      failure
+    })
+    return session
+  }
+
   async function openLog(label: string, kind: LogKind): Promise<void> {
     focusService(label)
     setBusyLabel(label)
     setCardFeedback(label, {
       tone: 'progress',
-      message: `Loading ${getLogButtonLabel(kind)}...`
+      message: `Opening live ${getLogButtonLabel(kind)} tail...`
     })
 
     try {
-      const nextLogs = await window.launchdControl.readLogs(label)
-      const file = findLogFile(nextLogs, kind)
-
-      setContentPanel(buildLogPanel(nextLogs, kind, actionFailures[label] ?? null))
+      await openLogTerminal(label, kind)
       setCardFeedback(label, {
-        tone: file ? 'success' : 'neutral',
-        message: file
-          ? `${getLogButtonLabel(kind)} ready.`
-          : `No ${getLogButtonLabel(kind)} path declared.`
+        tone: 'success',
+        message: `Live ${getLogButtonLabel(kind)} tail ready.`
       })
     } catch (logsError) {
       const message = logsError instanceof Error ? logsError.message : String(logsError)
-      setCardFeedback(label, { tone: 'error', message: `Log load failed: ${message}` })
+      setCardFeedback(label, { tone: 'error', message: `Log tail failed: ${message}` })
     } finally {
       setBusyLabel(null)
     }
@@ -3032,11 +3080,13 @@ export default function App(): JSX.Element {
 	                <p className="section-tag">
 	                  {contentPanel.mode === 'log'
                     ? `${getLogButtonLabel(contentPanel.kind)} tail`
-                    : contentPanel.terminalMode === 'logs'
+                    : contentPanel.terminalMode === 'logs' ||
+                        contentPanel.terminalMode === 'stdout' ||
+                        contentPanel.terminalMode === 'stderr'
                       ? 'Embedded terminal'
                       : 'Embedded shell'}
                 </p>
-                <h2>{contentPanel.mode === 'log' ? 'Log window' : 'Embedded terminal'}</h2>
+                <h2>{contentPanel.mode === 'log' ? 'Log window' : getTerminalHeading(contentPanel.terminalMode)}</h2>
                 <p className="topbar__detail">
                   {contentPanel.mode === 'log' ? contentPanel.title : contentPanel.session.title}
                 </p>
@@ -3290,8 +3340,10 @@ export default function App(): JSX.Element {
             />
           ) : contentPanel.mode === 'terminal' ? (
             <TerminalPanel
+              busy={busyLabel === contentPanel.serviceLabel}
               panel={contentPanel}
 	              service={terminalService}
+              onAction={handleAction}
 	              onBack={() => void handleCloseTerminal()}
 	            />
 	          ) : services.length === 0 ? (
@@ -5290,16 +5342,23 @@ function LogPanel({
 }
 
 function TerminalPanel({
+  busy,
   panel,
   service,
+  onAction,
   onBack
 }: {
+  busy: boolean
   panel: TerminalPanelState
   service: LaunchdService | null
+  onAction: (label: string, action: LaunchdAction) => Promise<void>
   onBack: () => void
 }): JSX.Element {
   const terminalHostRef = useRef<HTMLDivElement | null>(null)
   const [exitState, setExitState] = useState<TerminalExitEvent | null>(null)
+  const isLogTerminal =
+    panel.terminalMode === 'logs' || panel.terminalMode === 'stdout' || panel.terminalMode === 'stderr'
+  const failure = panel.failure ?? null
 
   useEffect(() => {
     const host = terminalHostRef.current
@@ -5355,7 +5414,11 @@ function TerminalPanel({
         return
       }
 
-      term.write(event.data)
+      term.write(event.data, () => {
+        if (panel.terminalMode === 'logs' || panel.terminalMode === 'stdout' || panel.terminalMode === 'stderr') {
+          term.scrollToBottom()
+        }
+      })
     })
     const unsubscribeExit = window.launchdControl.onTerminalExit((event) => {
       if (event.id !== panel.session.id) {
@@ -5381,9 +5444,13 @@ function TerminalPanel({
     })
 
     term.loadAddon(fitAddon)
+    host.replaceChildren()
     term.open(host)
     fitAddon.fit()
     term.focus()
+    if (panel.terminalMode === 'logs' || panel.terminalMode === 'stdout' || panel.terminalMode === 'stderr') {
+      term.scrollToBottom()
+    }
     window.launchdControl.resizeTerminal(panel.session.id, term.cols, term.rows)
     resizeObserver.observe(host)
 
@@ -5398,49 +5465,76 @@ function TerminalPanel({
   }, [panel.session.id])
 
   return (
-    <article className="terminal-panel">
-      <header className="terminal-panel__header">
-        <div>
-          <p className="eyebrow">Embedded PTY</p>
-          <h3>{getTerminalHeading(panel.terminalMode)}</h3>
-          <p className="terminal-panel__subtitle">
-            {service ? service.name : panel.session.title}
+    <article className={`terminal-panel ${isLogTerminal ? 'terminal-panel--log' : ''}`}>
+      {!isLogTerminal ? (
+        <header className="terminal-panel__header">
+          <div>
+            <p className="eyebrow">Embedded PTY</p>
+            <h3>{getTerminalHeading(panel.terminalMode)}</h3>
+            <p className="terminal-panel__subtitle">
+              {service ? service.name : panel.session.title}
+            </p>
+          </div>
+
+          <div className="terminal-panel__meta">
+            <span>{panel.session.cwd}</span>
+            <span>{panel.session.shell}</span>
+            <span>{getTerminalSummary(panel.terminalMode)}</span>
+            {service ? <span>{service.label}</span> : null}
+          </div>
+        </header>
+      ) : null}
+
+      {!isLogTerminal ? (
+        <div className="terminal-panel__toolbar">
+          <p>
+            This starts in an interactive shell after printing launchctl context for the selected service.
           </p>
+          <div className="terminal-panel__toolbar-actions">
+            {exitState ? (
+              <span className="terminal-panel__status">
+                Exit {exitState.exitCode}
+                {typeof exitState.signal === 'number' ? ` · signal ${exitState.signal}` : ''}
+              </span>
+            ) : (
+              <span className="terminal-panel__status is-live">Live session</span>
+            )}
+            <button className="ghost-button toolbar-button topbar-button" onClick={onBack} type="button">
+              <span className="button-icon">
+                <ArrowLeft />
+              </span>
+              <span className="button-label">Back to services</span>
+            </button>
+          </div>
         </div>
-
-        <div className="terminal-panel__meta">
-          <span>{panel.session.cwd}</span>
-          <span>{panel.session.shell}</span>
-          <span>{getTerminalSummary(panel.terminalMode)}</span>
-          {service ? <span>{service.label}</span> : null}
-        </div>
-      </header>
-
-      <div className="terminal-panel__toolbar">
-        <p>
-          {panel.terminalMode === 'logs'
-            ? 'This starts with the tail command from the selected service. Press Ctrl+C to stop tailing and keep the shell.'
-            : 'This starts in an interactive shell after printing launchctl context for the selected service.'}
-        </p>
-        <div className="terminal-panel__toolbar-actions">
-          {exitState ? (
-            <span className="terminal-panel__status">
-              Exit {exitState.exitCode}
-              {typeof exitState.signal === 'number' ? ` · signal ${exitState.signal}` : ''}
-            </span>
-          ) : (
-            <span className="terminal-panel__status is-live">Live session</span>
-          )}
-          <button className="ghost-button toolbar-button topbar-button" onClick={onBack} type="button">
-            <span className="button-icon">
-              <ArrowLeft />
-            </span>
-            <span className="button-label">Back to services</span>
-          </button>
-        </div>
-      </div>
+      ) : null}
 
       <div className="terminal-panel__viewport">
+        {isLogTerminal ? (
+          <div className="terminal-panel__log-actions">
+            {failure && service ? (
+              <button
+                className="ghost-button toolbar-button topbar-button"
+                disabled={busy}
+                onClick={() => void onAction(service.label, failure.action)}
+                type="button"
+              >
+                <span className="button-icon">
+                  <RotateCw />
+                </span>
+                <span className="button-label">{`Retry ${getActionLabel(failure.action).toLowerCase()}`}</span>
+              </button>
+            ) : null}
+            {exitState ? (
+              <span className="terminal-panel__status">
+                Exit {exitState.exitCode}
+                {typeof exitState.signal === 'number' ? ` · signal ${exitState.signal}` : ''}
+              </span>
+            ) : (
+              <span className="terminal-panel__status is-live">Live tail</span>
+            )}
+          </div>
+        ) : null}
         <div className="terminal-panel__host" ref={terminalHostRef} />
       </div>
     </article>
