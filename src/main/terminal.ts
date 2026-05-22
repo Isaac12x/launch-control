@@ -35,7 +35,10 @@ export function openTerminalSession(
     label: service.label,
     mode,
     title: service.name,
-    subtitle: mode === 'logs' ? 'Streaming declared log targets' : `Interactive shell for ${service.label}`,
+    subtitle:
+      mode === 'logs' || mode === 'stdout' || mode === 'stderr'
+        ? 'Streaming declared log targets'
+        : `Interactive shell for ${service.label}`,
     cwd,
     shell
   }
