@@ -881,6 +881,10 @@ function summarizeAutomation(service: LaunchdService, services: LaunchdService[]
     parts.push('Keeps this service running while LaunchControl is open.')
   }
 
+  if (service.automation.critical) {
+    parts.push('Sends a notification when this service goes down.')
+  }
+
   return parts.join(' ') || 'No automation rules.'
 }
 
@@ -917,6 +921,10 @@ function getServiceSignals(service: LaunchdService, services: LaunchdService[] =
 
   if (service.automation.ensureRunning) {
     signals.push('Always on')
+  }
+
+  if (service.automation.critical) {
+    signals.push('Critical')
   }
 
   return signals
@@ -2584,7 +2592,8 @@ export default function App(): JSX.Element {
       Boolean(settings.startCondition) ||
       settings.automaticStartTimes.length > 0 ||
       settings.startOnLaunch ||
-      settings.ensureRunning
+      settings.ensureRunning ||
+      settings.critical
 
     focusService(label)
     setBusyLabel(label)
@@ -4760,6 +4769,7 @@ function AutomationPanel({
   const [startOnLaunch, setStartOnLaunch] = useState(false)
   const [launchDelaySeconds, setLaunchDelaySeconds] = useState('0')
   const [ensureRunning, setEnsureRunning] = useState(false)
+  const [critical, setCritical] = useState(false)
   const [localError, setLocalError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -4771,6 +4781,7 @@ function AutomationPanel({
       setStartOnLaunch(false)
       setLaunchDelaySeconds('0')
       setEnsureRunning(false)
+      setCritical(false)
       setLocalError(null)
       return
     }
@@ -4782,6 +4793,7 @@ function AutomationPanel({
     setStartOnLaunch(service.automation.startOnLaunch)
     setLaunchDelaySeconds(String(service.automation.launchDelaySeconds))
     setEnsureRunning(service.automation.ensureRunning)
+    setCritical(service.automation.critical)
     setLocalError(null)
   }, [service])
 
@@ -4825,7 +4837,8 @@ function AutomationPanel({
       automaticStartTimes: parsedTimes.times,
       startOnLaunch,
       launchDelaySeconds: startOnLaunch ? Math.round(parsedLaunchDelay) : 0,
-      ensureRunning
+      ensureRunning,
+      critical
     })
   }
 
@@ -4922,6 +4935,18 @@ function AutomationPanel({
             <em>LaunchControl will try to restart it whenever it is enabled but not running.</em>
           </span>
         </label>
+
+        <label aria-label="Mark as critical service" className="toggle-field">
+          <input
+            checked={critical}
+            onChange={(event) => setCritical(event.target.checked)}
+            type="checkbox"
+          />
+          <span>
+            <strong>Critical service</strong>
+            <em>LaunchControl will send a notification when it stops after being observed running.</em>
+          </span>
+        </label>
       </div>
 
       <p className="sidebar-detail">{summarizeAutomation(currentService, services)}</p>
@@ -4942,13 +4967,15 @@ function AutomationPanel({
             setStartOnLaunch(false)
             setLaunchDelaySeconds('0')
             setEnsureRunning(false)
+            setCritical(false)
             setLocalError(null)
             void onSave(currentService.label, {
               startCondition: null,
               automaticStartTimes: [],
               startOnLaunch: false,
               launchDelaySeconds: 0,
-              ensureRunning: false
+              ensureRunning: false,
+              critical: false
             })
           }}
         >

@@ -17,6 +17,7 @@ interface PendingDependencyStart {
 interface AutomationCoordinatorOptions {
   refreshServices: () => Promise<LaunchdService[]>
   startService: (label: string) => Promise<LaunchdService[]>
+  notifyCriticalServiceDown?: (service: LaunchdService) => Promise<void> | void
   onError?: (error: unknown) => void
 }
 
@@ -108,6 +109,19 @@ function getMinuteStamp(date: Date): string {
 
 function isStartable(service: LaunchdService): boolean {
   return service.enabled && !service.running && !service.completed
+}
+
+function didCriticalServiceGoDown(
+  service: LaunchdService,
+  previous: ServiceRuntimeSnapshot | undefined
+): boolean {
+  return (
+    service.automation.critical &&
+    service.enabled &&
+    previous?.running === true &&
+    !service.running &&
+    !service.completed
+  )
 }
 
 export function startAutomationCoordinator(
@@ -287,6 +301,24 @@ export function startAutomationCoordinator(
     return services
   }
 
+  async function notifyCriticalServicesDown(services: LaunchdService[]): Promise<void> {
+    if (!options.notifyCriticalServiceDown) {
+      return
+    }
+
+    for (const service of services) {
+      if (!didCriticalServiceGoDown(service, lastSnapshots.get(service.label))) {
+        continue
+      }
+
+      try {
+        await options.notifyCriticalServiceDown(service)
+      } catch (error) {
+        options.onError?.(error)
+      }
+    }
+  }
+
   async function runCycle(): Promise<void> {
     if (disposed) {
       return
@@ -295,6 +327,7 @@ export function startAutomationCoordinator(
     let services = await options.refreshServices()
     const now = new Date()
 
+    await notifyCriticalServicesDown(services)
     services = await runLaunchStarts(services, now)
     services = await runScheduledStarts(services, now)
     services = await runDependencyStarts(services, now)

@@ -1254,7 +1254,8 @@ export async function listServices(
         automaticStartTimes: [],
         startOnLaunch: false,
         launchDelaySeconds: 0,
-        ensureRunning: false
+        ensureRunning: false,
+        critical: false
       }
     }
 
@@ -1265,7 +1266,8 @@ export async function listServices(
       automaticStartTimes: [],
       startOnLaunch: false,
       launchDelaySeconds: 0,
-      ensureRunning: false
+      ensureRunning: false,
+      critical: false
     }
 
     return applyRuntimeSnapshotToService(
