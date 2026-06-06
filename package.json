@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "npm run prepare:ghostty && electron-vite dev",
     "build": "npm run prepare:ghostty && electron-vite build",
+    "test:automation-coordinator": "node scripts/test-automation-coordinator.mjs",
     "test:live-runtime": "node scripts/test-live-runtime.mjs",
     "test:log-tail-flow": "node scripts/test-log-tail-flow.mjs",
     "test:repository-template": "node scripts/test-repository-template.mjs",

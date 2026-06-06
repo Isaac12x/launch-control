@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added critical service monitoring with notifications when a critical service goes down.
+
 ## [1.0.4] - 2026-05-14
 
 ### Changed

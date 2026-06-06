@@ -109,6 +109,7 @@ export interface ServiceAutomationSettings {
   startOnLaunch: boolean
   launchDelaySeconds: number
   ensureRunning: boolean
+  critical: boolean
 }
 
 export interface ServiceLoadSnapshot {

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, Tray, nativeImage } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, Notification, Tray, nativeImage } from 'electron'
 import type { NativeImage, OpenDialogOptions } from 'electron'
 import { join } from 'node:path'
 import type {
@@ -138,6 +138,20 @@ function getLoginItemSettings(): LoginItemSettings {
   return {
     openAtLogin: app.getLoginItemSettings().openAtLogin
   }
+}
+
+function notifyCriticalServiceDown(service: LaunchdService): void {
+  if (!Notification.isSupported()) {
+    return
+  }
+
+  const exitSuffix =
+    service.lastExitStatus !== null ? ` Last exit: ${service.lastExitStatus}.` : ''
+
+  new Notification({
+    title: `${service.name} went down`,
+    body: `Critical service ${service.label} is no longer running.${exitSuffix}`
+  }).show()
 }
 
 async function refreshServices(): Promise<LaunchdService[]> {
@@ -474,6 +488,7 @@ app.whenReady().then(async () => {
       await performAction(services, label, 'start')
       return refreshServices()
     },
+    notifyCriticalServiceDown,
     onError: (error) => {
       console.error('Automation coordinator failed.', error)
     }

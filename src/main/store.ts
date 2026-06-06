@@ -95,7 +95,8 @@ function normalizeAutomationSettings(value: unknown): ServiceAutomationSettings 
       automaticStartTimes: [],
       startOnLaunch: false,
       launchDelaySeconds: 0,
-      ensureRunning: false
+      ensureRunning: false,
+      critical: false
     }
   }
 
@@ -106,7 +107,8 @@ function normalizeAutomationSettings(value: unknown): ServiceAutomationSettings 
     automaticStartTimes: normalizeAutomaticStartTimes(value.automaticStartTimes),
     startOnLaunch,
     launchDelaySeconds: startOnLaunch ? normalizeDelaySeconds(value.launchDelaySeconds) : 0,
-    ensureRunning: normalizeBoolean(value.ensureRunning)
+    ensureRunning: normalizeBoolean(value.ensureRunning),
+    critical: normalizeBoolean(value.critical)
   }
 }
 
@@ -283,7 +285,8 @@ export async function setAutomationSettings(
     !normalized.startCondition &&
     normalized.automaticStartTimes.length === 0 &&
     !normalized.startOnLaunch &&
-    !normalized.ensureRunning
+    !normalized.ensureRunning &&
+    !normalized.critical
   ) {
     delete automations[label]
   } else {
