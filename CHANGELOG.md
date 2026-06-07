@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Added critical service monitoring with notifications when a critical service goes down.
+- Added collapsible sections to the tree service detail view.
+
+### Fixed
+
+- Open the app directly into the services tree view and keep the runtime/actions card sized to its content.
 
 ## [1.0.4] - 2026-05-14
 

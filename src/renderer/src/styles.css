@@ -210,6 +210,7 @@ button {
 .masthead h1,
 .topbar h2,
 .tree-panel h3,
+.runtime-detail-section h3,
 .detail-panel h3,
 .sidebar-panel h2,
 .service-card h3,
@@ -1178,6 +1179,7 @@ button {
 }
 
 .service-detail--tree {
+  grid-auto-rows: max-content;
   min-height: 0;
   overflow: auto;
   padding-right: 0.2rem;
@@ -1202,6 +1204,69 @@ button {
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: start;
   column-gap: 1rem;
+}
+
+.detail-panel__header-actions {
+  display: flex;
+  align-items: start;
+  justify-content: flex-end;
+  gap: 0.65rem;
+  min-width: 0;
+}
+
+.detail-panel__toggle {
+  flex: none;
+  width: 2.4rem;
+  height: 2.4rem;
+  background: oklch(0.98 0.01 82 / 0.76);
+}
+
+.detail-panel__toggle-icon {
+  transition: transform 160ms ease;
+}
+
+.detail-panel__toggle-icon.is-expanded {
+  transform: rotate(90deg);
+}
+
+.detail-panel__content {
+  display: grid;
+  gap: 0.9rem;
+  min-width: 0;
+}
+
+.runtime-detail-section {
+  display: grid;
+  grid-auto-rows: max-content;
+  align-content: start;
+  gap: 0.65rem;
+  min-width: 0;
+  min-height: max-content;
+}
+
+.runtime-detail-section__header {
+  padding: 0 0.25rem;
+}
+
+.runtime-detail-section h3 {
+  margin-top: 0.2rem;
+  font-size: clamp(1.45rem, 2.6vw, 2rem);
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  text-wrap: balance;
+}
+
+.runtime-detail-section__content {
+  display: grid;
+  min-width: 0;
+  min-height: max-content;
+}
+
+.runtime-detail-section__content .service-card {
+  align-self: start;
+  height: auto;
+  min-height: max-content;
+  overflow: visible;
 }
 
 .detail-panel h3 {
@@ -2557,6 +2622,7 @@ button {
   .topbar__actions,
   .topbar__controls-row,
   .topbar__action-stack,
+  .detail-panel__header-actions,
   .terminal-panel__meta,
   .log-panel__meta,
   .log-triage__actions {
@@ -2606,6 +2672,10 @@ button {
 
   .plist-editor__actions {
     grid-template-columns: 1fr;
+  }
+
+  .detail-panel__header-actions {
+    flex-wrap: wrap;
   }
 
   .plist-snippet-card__header {
