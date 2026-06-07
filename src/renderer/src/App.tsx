@@ -60,6 +60,8 @@ type ServiceSortDirection = 'asc' | 'desc'
 type ServiceSortOption = `${ServiceSortField}-${ServiceSortDirection}`
 type CreateServiceMode = 'plist' | 'repository'
 type SidebarSection = 'overview' | 'services'
+type DetailSectionId = 'selection' | 'runtime' | 'automation' | 'plist'
+type DetailSectionState = Record<DetailSectionId, boolean>
 type RecoverableLaunchdAction = Extract<LaunchdAction, 'start' | 'restart'>
 type TreeFolderAction = Extract<LaunchdAction, 'start' | 'stop' | 'restart' | 'enable' | 'disable'>
 type ServiceLoadResolver = (service: LaunchdService) => ServiceLoadSnapshot
@@ -157,6 +159,12 @@ interface RepositoryCreateState {
 
 const servicesPanel: ContentPanelState = { mode: 'services' }
 const createServicePanel: ContentPanelState = { mode: 'create' }
+const defaultDetailSectionState: DetailSectionState = {
+  selection: true,
+  runtime: true,
+  automation: true,
+  plist: true
+}
 const timePattern = /^([01]\d|2[0-3]):([0-5]\d)$/
 const liveRefreshIntervalMs = 1000
 const treeServiceLabelsMimeType = 'application/x-launchcontrol-service-labels'
@@ -1601,7 +1609,7 @@ export default function App(): JSX.Element {
   const [selectedLabel, setSelectedLabel] = useState<string | null>(null)
   const [selectedTreeLabels, setSelectedTreeLabels] = useState<string[]>([])
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
-  const [sidebarSection, setSidebarSection] = useState<SidebarSection>('overview')
+  const [sidebarSection, setSidebarSection] = useState<SidebarSection>('services')
   const [treeSelectionBusy, setTreeSelectionBusy] = useState(false)
   const [treeFolderActionBusy, setTreeFolderActionBusy] = useState<TreeFolderAction | null>(null)
   const [treeDraggedLabels, setTreeDraggedLabels] = useState<string[]>([])
@@ -1617,7 +1625,7 @@ export default function App(): JSX.Element {
   const [openAtLogin, setOpenAtLogin] = useState(false)
   const [loginItemBusy, setLoginItemBusy] = useState(false)
   const [expandedFolders, setExpandedFolders] = useState<Record<string, boolean>>({})
-  const [serviceViewMode, setServiceViewMode] = useState<ServiceViewMode>('grid')
+  const [serviceViewMode, setServiceViewMode] = useState<ServiceViewMode>('tree')
   const [searchQuery, setSearchQuery] = useState('')
   const [treeFolderDraft, setTreeFolderDraft] = useState('')
   const [treeFolderMessage, setTreeFolderMessage] = useState<string | null>(null)
@@ -4010,6 +4018,33 @@ function CreateServicePanel({
   )
 }
 
+function DetailSectionCollapseButton({
+  expanded,
+  label,
+  onToggle
+}: {
+  expanded: boolean
+  label: string
+  onToggle: () => void
+}): JSX.Element {
+  const actionLabel = expanded ? 'Collapse' : 'Expand'
+
+  return (
+    <button
+      aria-expanded={expanded}
+      aria-label={`${actionLabel} ${label}`}
+      className="icon-button detail-panel__toggle"
+      onClick={onToggle}
+      title={`${actionLabel} ${label}`}
+      type="button"
+    >
+      <span className={`button-icon detail-panel__toggle-icon ${expanded ? 'is-expanded' : ''}`}>
+        <ChevronRight />
+      </span>
+    </button>
+  )
+}
+
 function TreeServiceDetail({
   service,
   services,
@@ -4035,6 +4070,16 @@ function TreeServiceDetail({
   onSaveAutomation: (label: string, settings: ServiceAutomationSettings) => Promise<void>
   onSavePlist: (label: string, content: string) => Promise<void>
 }): JSX.Element {
+  const [expandedSections, setExpandedSections] =
+    useState<DetailSectionState>(defaultDetailSectionState)
+
+  function toggleDetailSection(section: DetailSectionId): void {
+    setExpandedSections((current) => ({
+      ...current,
+      [section]: !current[section]
+    }))
+  }
+
   if (!service) {
     return (
       <div className="service-detail service-detail--tree">
@@ -4043,16 +4088,25 @@ function TreeServiceDetail({
     )
   }
 
+  const serviceFeedback = feedbacks[service.label] ?? getDefaultCardFeedback(service)
+
   return (
     <div className="service-detail service-detail--tree">
       <section className="detail-panel">
-        <header className="detail-panel__header">
-          <p className="eyebrow">Selection</p>
-          <h3>{service.name}</h3>
-          <p className="detail-panel__summary">{getServiceStateSummary(service)}</p>
+        <header className="detail-panel__header detail-panel__header--split">
+          <div>
+            <p className="eyebrow">Selection</p>
+            <h3>{service.name}</h3>
+            <p className="detail-panel__summary">{getServiceStateSummary(service)}</p>
+          </div>
+          <DetailSectionCollapseButton
+            expanded={expandedSections.selection}
+            label="selection details"
+            onToggle={() => toggleDetailSection('selection')}
+          />
         </header>
 
-        <div className="detail-fields">
+        <div className="detail-fields detail-panel__content" hidden={!expandedSections.selection}>
           <div>
             <span>Label</span>
             <strong>{service.label}</strong>
@@ -4081,36 +4135,64 @@ function TreeServiceDetail({
         </div>
       </section>
 
-      <ServiceCard
-        active
-        allServices={services}
-        busy={treeBusy || busyLabel === service.label}
-        delayIndex={0}
-        feedback={feedbacks[service.label] ?? getDefaultCardFeedback(service)}
-        onAction={onAction}
-        onLog={onLog}
-        onRename={onRename}
-        onSelect={onSelect}
-        service={service}
-      />
-
-      <section className="detail-panel">
-        <header className="detail-panel__header">
-          <p className="eyebrow">Automation</p>
-          <h3>Rules</h3>
-          <p className="detail-panel__summary">{summarizeAutomation(service, services)}</p>
+      <section className="runtime-detail-section">
+        <header className="runtime-detail-section__header detail-panel__header detail-panel__header--split">
+          <div>
+            <p className="eyebrow">Runtime</p>
+            <h3>Status and actions</h3>
+            <p className="detail-panel__summary">{serviceFeedback.message}</p>
+          </div>
+          <DetailSectionCollapseButton
+            expanded={expandedSections.runtime}
+            label="runtime actions"
+            onToggle={() => toggleDetailSection('runtime')}
+          />
         </header>
 
-        <AutomationPanel
-          busy={treeBusy || busyLabel === service.label}
-          onSave={onSaveAutomation}
-          service={service}
-          services={services}
-        />
+        <div className="runtime-detail-section__content" hidden={!expandedSections.runtime}>
+          <ServiceCard
+            active
+            allServices={services}
+            busy={treeBusy || busyLabel === service.label}
+            delayIndex={0}
+            feedback={serviceFeedback}
+            onAction={onAction}
+            onLog={onLog}
+            onRename={onRename}
+            onSelect={onSelect}
+            service={service}
+          />
+        </div>
+      </section>
+
+      <section className="detail-panel">
+        <header className="detail-panel__header detail-panel__header--split">
+          <div>
+            <p className="eyebrow">Automation</p>
+            <h3>Rules</h3>
+            <p className="detail-panel__summary">{summarizeAutomation(service, services)}</p>
+          </div>
+          <DetailSectionCollapseButton
+            expanded={expandedSections.automation}
+            label="automation rules"
+            onToggle={() => toggleDetailSection('automation')}
+          />
+        </header>
+
+        <div className="detail-panel__content" hidden={!expandedSections.automation}>
+          <AutomationPanel
+            busy={treeBusy || busyLabel === service.label}
+            onSave={onSaveAutomation}
+            service={service}
+            services={services}
+          />
+        </div>
       </section>
 
       <LaunchdPlistEditorPanel
         busy={treeBusy || busyLabel === service.label}
+        expanded={expandedSections.plist}
+        onToggle={() => toggleDetailSection('plist')}
         onSave={onSavePlist}
         service={service}
       />
@@ -4121,10 +4203,14 @@ function TreeServiceDetail({
 function LaunchdPlistEditorPanel({
   service,
   busy,
+  expanded,
+  onToggle,
   onSave
 }: {
   service: LaunchdService
   busy: boolean
+  expanded: boolean
+  onToggle: () => void
   onSave: (label: string, content: string) => Promise<void>
 }): JSX.Element {
   const [document, setDocument] = useState<LaunchdPlistDocument | null>(null)
@@ -4327,144 +4413,153 @@ function LaunchdPlistEditorPanel({
             {loading ? 'Loading plist...' : (document?.plistPath ?? 'Plist unavailable.')}
           </p>
         </div>
-        {!loading && document ? (
-          editing ? (
-            <button className="ghost-button" onClick={() => cancelEdit()} type="button">
-              Close editor
-            </button>
-          ) : (
-            <button className="ghost-button" onClick={() => beginEdit()} type="button">
-              Edit plist
-            </button>
-          )
-        ) : null}
+        <div className="detail-panel__header-actions">
+          {!loading && document ? (
+            editing ? (
+              <button className="ghost-button" onClick={() => cancelEdit()} type="button">
+                Close editor
+              </button>
+            ) : (
+              <button className="ghost-button" onClick={() => beginEdit()} type="button">
+                Edit plist
+              </button>
+            )
+          ) : null}
+          <DetailSectionCollapseButton
+            expanded={expanded}
+            label="launchd plist"
+            onToggle={onToggle}
+          />
+        </div>
       </header>
 
-      {error ? <div className="error-banner">{error}</div> : null}
-      {loading ? <div className="empty-state">Loading plist...</div> : null}
-      {!loading && document ? (
-        <div className={`plist-editor ${editing ? 'is-editing' : 'is-reading'}`}>
-          {editing ? (
-            <div className="plist-editor__workspace">
-              <label className="field-group">
-                <span>Raw plist XML</span>
-                <textarea
-                  ref={textareaRef}
-                  className="plist-editor__textarea"
-                  onChange={(event) => {
-                    setDraftContent(event.target.value)
-                    syncSelection(event.target)
-                    setError(null)
-                    setLocalMessage(null)
-                  }}
-                  onClick={(event) => syncSelection(event.currentTarget)}
-                  onKeyUp={(event) => syncSelection(event.currentTarget)}
-                  onSelect={(event) => syncSelection(event.currentTarget)}
-                  spellCheck={false}
-                  value={draftContent}
-                />
-              </label>
+      <div className="detail-panel__content" hidden={!expanded}>
+        {error ? <div className="error-banner">{error}</div> : null}
+        {loading ? <div className="empty-state">Loading plist...</div> : null}
+        {!loading && document ? (
+          <div className={`plist-editor ${editing ? 'is-editing' : 'is-reading'}`}>
+            {editing ? (
+              <div className="plist-editor__workspace">
+                <label className="field-group">
+                  <span>Raw plist XML</span>
+                  <textarea
+                    ref={textareaRef}
+                    className="plist-editor__textarea"
+                    onChange={(event) => {
+                      setDraftContent(event.target.value)
+                      syncSelection(event.target)
+                      setError(null)
+                      setLocalMessage(null)
+                    }}
+                    onClick={(event) => syncSelection(event.currentTarget)}
+                    onKeyUp={(event) => syncSelection(event.currentTarget)}
+                    onSelect={(event) => syncSelection(event.currentTarget)}
+                    spellCheck={false}
+                    value={draftContent}
+                  />
+                </label>
 
-              <aside className="plist-library" aria-label="launchd plist snippets">
-                <header className="plist-library__header">
-                  <h4>Insert library</h4>
-                  <p>Copy a snippet or insert it at the cursor.</p>
-                </header>
+                <aside className="plist-library" aria-label="launchd plist snippets">
+                  <header className="plist-library__header">
+                    <h4>Insert library</h4>
+                    <p>Copy a snippet or insert it at the cursor.</p>
+                  </header>
 
-                <div className="plist-library__list">
-                  {[
-                    { key: 'plist', title: '.plist keys', snippets: launchdPlistLibrary },
-                    { key: 'launchd', title: 'launchd commands', snippets: launchdCommandLibrary }
-                  ].map((section) => (
-                    <section key={section.key} className="plist-library__section">
-                      <h5>{section.title}</h5>
-                      {section.snippets.map((snippet) => {
-                        const copied = copiedSnippetKey === snippet.key
+                  <div className="plist-library__list">
+                    {[
+                      { key: 'plist', title: '.plist keys', snippets: launchdPlistLibrary },
+                      { key: 'launchd', title: 'launchd commands', snippets: launchdCommandLibrary }
+                    ].map((section) => (
+                      <section key={section.key} className="plist-library__section">
+                        <h5>{section.title}</h5>
+                        {section.snippets.map((snippet) => {
+                          const copied = copiedSnippetKey === snippet.key
 
-                        return (
-                          <article
-                            key={snippet.key}
-                            aria-label={`${snippet.title} snippet`}
-                            className={`plist-snippet-card ${copied ? 'is-copied' : ''}`}
-                            onClick={() => void handleSnippetCopy(snippet)}
-                            onKeyDown={(event) => handleSnippetKeyDown(event, snippet)}
-                            role="button"
-                            tabIndex={0}
-                          >
-                            <div className="plist-snippet-card__header">
-                              <div>
-                                <strong>{snippet.title}</strong>
-                                <p>{snippet.description}</p>
-                              </div>
-                              <span className="plist-snippet-card__badge">
-                                {copied ? 'Copied' : 'Copy'}
-                              </span>
-                            </div>
-                            <pre className="plist-snippet-card__preview">{snippet.snippet}</pre>
-                            <button
-                              className="ghost-button sidebar-button"
-                              onClick={(event) => {
-                                event.stopPropagation()
-                                insertSnippet(snippet)
-                              }}
-                              type="button"
+                          return (
+                            <article
+                              key={snippet.key}
+                              aria-label={`${snippet.title} snippet`}
+                              className={`plist-snippet-card ${copied ? 'is-copied' : ''}`}
+                              onClick={() => void handleSnippetCopy(snippet)}
+                              onKeyDown={(event) => handleSnippetKeyDown(event, snippet)}
+                              role="button"
+                              tabIndex={0}
                             >
-                              Insert
-                            </button>
-                          </article>
-                        )
-                      })}
-                    </section>
-                  ))}
-                </div>
-              </aside>
-            </div>
-          ) : (
-            <div className="plist-read">
-              <pre className="source-panel__content plist-read__preview">{document.plistContent}</pre>
-            </div>
-          )}
+                              <div className="plist-snippet-card__header">
+                                <div>
+                                  <strong>{snippet.title}</strong>
+                                  <p>{snippet.description}</p>
+                                </div>
+                                <span className="plist-snippet-card__badge">
+                                  {copied ? 'Copied' : 'Copy'}
+                                </span>
+                              </div>
+                              <pre className="plist-snippet-card__preview">{snippet.snippet}</pre>
+                              <button
+                                className="ghost-button sidebar-button"
+                                onClick={(event) => {
+                                  event.stopPropagation()
+                                  insertSnippet(snippet)
+                                }}
+                                type="button"
+                              >
+                                Insert
+                              </button>
+                            </article>
+                          )
+                        })}
+                      </section>
+                    ))}
+                  </div>
+                </aside>
+              </div>
+            ) : (
+              <div className="plist-read">
+                <pre className="source-panel__content plist-read__preview">{document.plistContent}</pre>
+              </div>
+            )}
 
-          {localMessage ? <p className="sidebar-detail">{localMessage}</p> : null}
+            {localMessage ? <p className="sidebar-detail">{localMessage}</p> : null}
 
-          {editing ? (
-            <div className="panel-actions plist-editor__actions">
-              <button
-                className="ghost-button sidebar-button"
-                disabled={busy || !dirty}
-                onClick={() => void submit()}
-                type="button"
-              >
-                {busy ? 'Saving plist...' : 'Save plist'}
-              </button>
-              <button
-                className="ghost-button sidebar-button"
-                disabled={busy || !dirty || !document}
-                onClick={() => {
-                  setDraftContent(document?.plistContent ?? '')
-                  setError(null)
-                  setLocalMessage('Reverted to the on-disk plist.')
-                  selectionRef.current = {
-                    start: document?.plistContent.length ?? 0,
-                    end: document?.plistContent.length ?? 0
-                  }
-                }}
-                type="button"
-              >
-                Revert changes
-              </button>
-              <button
-                className="ghost-button sidebar-button"
-                disabled={busy}
-                onClick={() => cancelEdit()}
-                type="button"
-              >
-                Cancel edit
-              </button>
-            </div>
-          ) : null}
-        </div>
-      ) : null}
+            {editing ? (
+              <div className="panel-actions plist-editor__actions">
+                <button
+                  className="ghost-button sidebar-button"
+                  disabled={busy || !dirty}
+                  onClick={() => void submit()}
+                  type="button"
+                >
+                  {busy ? 'Saving plist...' : 'Save plist'}
+                </button>
+                <button
+                  className="ghost-button sidebar-button"
+                  disabled={busy || !dirty || !document}
+                  onClick={() => {
+                    setDraftContent(document?.plistContent ?? '')
+                    setError(null)
+                    setLocalMessage('Reverted to the on-disk plist.')
+                    selectionRef.current = {
+                      start: document?.plistContent.length ?? 0,
+                      end: document?.plistContent.length ?? 0
+                    }
+                  }}
+                  type="button"
+                >
+                  Revert changes
+                </button>
+                <button
+                  className="ghost-button sidebar-button"
+                  disabled={busy}
+                  onClick={() => cancelEdit()}
+                  type="button"
+                >
+                  Cancel edit
+                </button>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
     </section>
   )
 }
