@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-06-09
+
 ### Added
 
 - Added critical service monitoring with notifications when a critical service goes down.
@@ -14,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Restored full service card information by allowing long titles, labels, and service info to wrap instead of being clipped.
+- Fixed embedded terminal sessions by loading `node-pty` through the module namespace used by the Electron bundle.
+- Kept embedded log terminals stretched to the page height and pinned to the bottom after writes, exits, and resizes.
 - Open the app directly into the services tree view and keep the runtime/actions card sized to its content.
 
 ## [1.0.4] - 2026-05-14
