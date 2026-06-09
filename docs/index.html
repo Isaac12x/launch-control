@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LaunchControl — macOS launchd, done right</title>
+  <meta name="description" content="LaunchControl gives launchd the interface it always deserved. Manage all your macOS background services visually — with live stats, automation rules, and a built-in plist editor.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400;1,500&family=Outfit:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --cream:       #f5ede0;
+      --cream-mid:   #ede0cc;
+      --cream-dark:  #e2d3bc;
+      --text:        #1c1409;
+      --text-mid:    #3a2e1c;
+      --text-light:  #7a6548;
+      --red:         #b83a2e;
+      --red-muted:   #d4685e;
+      --red-light:   #f0e2e0;
+      --border:      #d4c4af;
+      --border-lt:   #e8ddd0;
+      --card:        #faf5ee;
+      --mono:        'JetBrains Mono', monospace;
+      --serif:       'Cormorant Garamond', Georgia, serif;
+      --sans:        'Outfit', system-ui, sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      background: var(--cream);
+      color: var(--text);
+      font-family: var(--sans);
+      font-weight: 300;
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+
+    /* ─── NAV ─── */
+    nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 200;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 1.1rem 3rem;
+      background: rgba(245,237,224,0.88);
+      backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border-lt);
+    }
+
+    .nav-logo {
+      font-family: var(--serif);
+      font-size: 1.25rem;
+      font-weight: 500;
+      letter-spacing: 0.01em;
+      color: var(--text);
+      text-decoration: none;
+    }
+    .nav-logo b { color: var(--red); font-weight: 500; }
+
+    .nav-links { display: flex; gap: 2rem; align-items: center; list-style: none; }
+    .nav-links a {
+      font-size: 0.8rem; font-weight: 400;
+      letter-spacing: 0.07em; text-transform: uppercase;
+      color: var(--text-light); text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--text); }
+
+    .nav-dl {
+      display: inline-flex; align-items: center; gap: 0.5rem;
+      padding: 0.55rem 1.4rem;
+      background: var(--text); color: var(--cream) !important;
+      border-radius: 3px;
+      font-size: 0.8rem !important; font-weight: 500 !important;
+      letter-spacing: 0.03em !important; text-transform: none !important;
+      transition: background 0.2s !important;
+    }
+    .nav-dl:hover { background: var(--red) !important; color: var(--cream) !important; }
+
+
+    /* ─── HERO ─── */
+    .hero {
+      min-height: 100vh;
+      padding: 9rem 3rem 5rem;
+      display: grid;
+      grid-template-columns: 1fr 1.25fr;
+      gap: 5rem;
+      align-items: center;
+      max-width: 1340px;
+      margin: 0 auto;
+    }
+
+    .hero-eyebrow {
+      display: inline-flex; align-items: center; gap: 0.6rem;
+      font-size: 0.72rem; font-weight: 500;
+      letter-spacing: 0.14em; text-transform: uppercase;
+      color: var(--red); margin-bottom: 1.4rem;
+    }
+    .hero-eyebrow::before {
+      content: ''; display: block;
+      width: 2.2rem; height: 1px; background: var(--red);
+    }
+
+    .hero-h1 {
+      font-family: var(--serif);
+      font-size: clamp(3.8rem, 6.5vw, 6.5rem);
+      line-height: 1.03;
+      font-weight: 400;
+      letter-spacing: -0.015em;
+      margin-bottom: 1.4rem;
+    }
+    .hero-h1 em { font-style: italic; color: var(--red); }
+
+    .hero-sub {
+      font-size: 1.05rem; font-weight: 300;
+      color: var(--text-mid); line-height: 1.75;
+      max-width: 470px; margin-bottom: 2.5rem;
+    }
+
+    .hero-actions { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+
+    .btn-primary {
+      display: inline-flex; align-items: center; gap: 0.55rem;
+      padding: 0.9rem 2rem;
+      background: var(--text); color: var(--cream);
+      border-radius: 3px; font-size: 0.9rem; font-weight: 500;
+      text-decoration: none; letter-spacing: 0.02em;
+      transition: background 0.2s, transform 0.15s;
+    }
+    .btn-primary:hover { background: var(--red); transform: translateY(-1px); }
+
+    .btn-ghost {
+      display: inline-flex; align-items: center; gap: 0.4rem;
+      padding: 0.9rem 1.25rem;
+      color: var(--text-light); font-size: 0.85rem;
+      text-decoration: none; transition: color 0.2s;
+    }
+    .btn-ghost:hover { color: var(--text); }
+
+    .hero-meta {
+      margin-top: 1.75rem; font-size: 0.78rem;
+      color: var(--text-light); letter-spacing: 0.03em;
+    }
+
+    .hero-visual { position: relative; }
+
+    .hero-img {
+      width: 100%; display: block;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      box-shadow:
+        0 2px 4px rgba(0,0,0,0.04),
+        0 8px 24px rgba(0,0,0,0.07),
+        0 32px 80px rgba(0,0,0,0.11);
+    }
+
+    .hero-badge {
+      position: absolute; bottom: -1.8rem; right: 1.5rem;
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 5px; padding: 0.7rem 1rem;
+      font-size: 0.72rem; font-weight: 500; letter-spacing: 0.05em;
+      display: flex; align-items: center; gap: 0.5rem;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.06);
+    }
+
+    .dot {
+      width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+    }
+    .dot-green { background: #4db87a; }
+    .dot-amber { background: #d4a017; }
+    .dot-red   { background: var(--red); }
+    .dot-gray  { background: #b0a090; }
+
+    /* ─── PROBLEM BAND ─── */
+    .problem {
+      background: var(--text); color: var(--cream);
+      padding: 6rem 3rem;
+    }
+    .problem-inner {
+      max-width: 1120px; margin: 0 auto;
+      display: grid; grid-template-columns: 1fr 1fr;
+      gap: 6rem; align-items: center;
+    }
+
+    .problem-h2 {
+      font-family: var(--serif);
+      font-size: clamp(2rem, 3.5vw, 3rem);
+      font-weight: 400; line-height: 1.2;
+      margin-bottom: 1.25rem;
+    }
+    .problem-h2 em { font-style: italic; color: var(--red-muted); }
+
+    .problem-p {
+      font-size: 0.92rem; line-height: 1.8;
+      color: rgba(245,237,224,0.65); max-width: 430px;
+    }
+
+    .code-block {
+      background: #100d08;
+      border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 8px;
+      padding: 1.75rem 2rem;
+      font-family: var(--mono);
+      font-size: 0.75rem; line-height: 1.9;
+      color: rgba(245,237,224,0.82);
+      overflow-x: auto;
+    }
+    .c-dim    { color: rgba(245,237,224,0.3); }
+    .c-cmd    { color: #d4a017; }
+    .c-path   { color: #7fb3d3; }
+    .c-flag   { color: var(--red-muted); }
+    .c-str    { color: #a3c97a; }
+
+    /* ─── SECTION COMMONS ─── */
+    .section-label {
+      font-size: 0.72rem; font-weight: 500;
+      letter-spacing: 0.14em; text-transform: uppercase;
+      color: var(--red); margin-bottom: 0.75rem;
+    }
+
+    .section-h2 {
+      font-family: var(--serif);
+      font-size: clamp(2.2rem, 4vw, 3.4rem);
+      font-weight: 400; line-height: 1.12;
+      color: var(--text); margin-bottom: 0.9rem;
+    }
+    .section-h2 em { font-style: italic; }
+
+    .section-p {
+      font-size: 0.92rem; color: var(--text-light);
+      line-height: 1.8; max-width: 580px;
+    }
+
+    /* ─── FEATURE CARDS ─── */
+    .feat-section {
+      padding: 7rem 3rem 4rem;
+      max-width: 1200px; margin: 0 auto;
+    }
+
+    .feat-intro { margin-bottom: 4rem; }
+
+    .feat-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1px; background: var(--border);
+      border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+    }
+
+    .feat-card {
+      background: var(--card);
+      padding: 2rem 1.75rem;
+    }
+
+    .feat-icon {
+      width: 38px; height: 38px;
+      background: var(--red-light); border-radius: 6px;
+      display: flex; align-items: center; justify-content: center;
+      color: var(--red); margin-bottom: 1.1rem; flex-shrink: 0;
+    }
+
+    .feat-card h3 {
+      font-family: var(--serif);
+      font-size: 1.3rem; font-weight: 500;
+      color: var(--text); margin-bottom: 0.5rem;
+    }
+
+    .feat-card p {
+      font-size: 0.84rem; line-height: 1.7; color: var(--text-light);
+    }
+
+    /* ─── SHOWCASE ROWS ─── */
+    .showcase { padding: 5rem 3rem; max-width: 1200px; margin: 0 auto; }
+
+    .show-row {
+      display: grid; grid-template-columns: 1fr 1fr;
+      gap: 5.5rem; align-items: center;
+      margin-bottom: 9rem;
+    }
+    .show-row:last-child { margin-bottom: 0; }
+    .show-row.flip { direction: rtl; }
+    .show-row.flip > * { direction: ltr; }
+
+    .show-h2 {
+      font-family: var(--serif);
+      font-size: clamp(1.9rem, 3.2vw, 2.9rem);
+      font-weight: 400; line-height: 1.12;
+      color: var(--text); margin-bottom: 1rem;
+    }
+    .show-h2 em { font-style: italic; }
+
+    .show-p {
+      font-size: 0.88rem; line-height: 1.8;
+      color: var(--text-mid); margin-bottom: 1rem;
+    }
+
+    .detail-list { list-style: none; margin-top: 1.5rem; }
+    .detail-list li {
+      display: flex; align-items: flex-start; gap: 0.75rem;
+      font-size: 0.84rem; color: var(--text-mid);
+      padding: 0.55rem 0;
+      border-bottom: 1px solid var(--border-lt);
+    }
+    .detail-list li:last-child { border-bottom: none; }
+    .detail-list li::before {
+      content: '—'; color: var(--red);
+      flex-shrink: 0; font-weight: 300; margin-top: 0.05em;
+    }
+
+    .show-img {
+      width: 100%; display: block;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      box-shadow:
+        0 2px 4px rgba(0,0,0,0.04),
+        0 8px 24px rgba(0,0,0,0.07),
+        0 32px 80px rgba(0,0,0,0.10);
+    }
+
+    /* ─── STATS BAND ─── */
+    .stats-band {
+      background: var(--cream-mid);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      padding: 4.5rem 3rem;
+    }
+    .stats-inner {
+      max-width: 960px; margin: 0 auto;
+      display: grid; grid-template-columns: repeat(4, 1fr);
+      gap: 2rem; text-align: center;
+    }
+
+    .stat-val {
+      font-family: var(--serif);
+      font-size: 3.5rem; font-weight: 400;
+      line-height: 1; color: var(--text);
+      margin-bottom: 0.4rem;
+    }
+    .stat-val sup { font-size: 1.5rem; color: var(--red); }
+
+    .stat-label {
+      font-size: 0.75rem; letter-spacing: 0.09em;
+      text-transform: uppercase; color: var(--text-light);
+    }
+
+    /* ─── CTA ─── */
+    .cta-section {
+      padding: 9rem 3rem; text-align: center;
+      max-width: 740px; margin: 0 auto;
+    }
+
+    .cta-h2 {
+      font-family: var(--serif);
+      font-size: clamp(2.8rem, 5.5vw, 5rem);
+      font-weight: 400; line-height: 1.08;
+      color: var(--text); margin-bottom: 1.25rem;
+    }
+    .cta-h2 em { font-style: italic; color: var(--red); }
+
+    .cta-p {
+      font-size: 1rem; line-height: 1.8;
+      color: var(--text-light); margin-bottom: 2.5rem;
+    }
+
+    .cta-actions {
+      display: flex; gap: 1rem;
+      justify-content: center; flex-wrap: wrap;
+      margin-bottom: 1.25rem;
+    }
+
+    .cta-note {
+      font-size: 0.78rem; color: var(--text-light); letter-spacing: 0.03em;
+    }
+
+    /* ─── FOOTER ─── */
+    .footer-wrap {
+      border-top: 1px solid var(--border);
+      padding: 2.25rem 3rem;
+      max-width: 1200px; margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+
+    .footer-logo {
+      font-family: var(--serif);
+      font-size: 1rem; color: var(--text-light);
+    }
+    .footer-logo b { color: var(--red); font-weight: 500; }
+
+    .footer-links { display: flex; gap: 2rem; list-style: none; }
+    .footer-links a {
+      font-size: 0.78rem; color: var(--text-light);
+      text-decoration: none; transition: color 0.2s;
+    }
+    .footer-links a:hover { color: var(--text); }
+
+    .footer-copy {
+      font-size: 0.75rem; color: var(--border);
+    }
+
+    /* ─── ANIMATIONS ─── */
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(18px); }
+      to   { opacity: 1; transform: none; }
+    }
+
+    .au { opacity: 0; animation: fadeUp 0.75s ease forwards; }
+    .au1 { animation-delay: 0.05s; }
+    .au2 { animation-delay: 0.18s; }
+    .au3 { animation-delay: 0.32s; }
+    .au4 { animation-delay: 0.5s; }
+    .au5 { animation-delay: 0.65s; }
+
+    .reveal {
+      opacity: 0; transform: translateY(22px);
+      transition: opacity 0.75s ease, transform 0.75s ease;
+    }
+    .reveal.in { opacity: 1; transform: none; }
+
+    .reveal-delay-1 { transition-delay: 0.07s; }
+    .reveal-delay-2 { transition-delay: 0.15s; }
+    .reveal-delay-3 { transition-delay: 0.23s; }
+    .reveal-delay-4 { transition-delay: 0.31s; }
+
+    /* ─── INLINE CODE ─── */
+    code {
+      display: inline-block;
+      background: var(--text); color: var(--cream);
+      font-family: var(--mono);
+      font-size: 0.75em;
+      padding: 0.15em 0.5em; border-radius: 3px;
+      white-space: nowrap; vertical-align: baseline;
+    }
+
+    /* ─── RESPONSIVE ─── */
+    @media (max-width: 1000px) {
+      .hero, .problem-inner, .show-row, .feat-grid {
+        grid-template-columns: 1fr;
+      }
+      .show-row.flip { direction: ltr; }
+      .stats-inner { grid-template-columns: repeat(2, 1fr); }
+      nav { padding: 1rem 1.5rem; }
+      .hero { padding: 7rem 1.5rem 4rem; min-height: auto; gap: 3rem; }
+      .problem { padding: 4rem 1.5rem; }
+      .problem-inner { gap: 3rem; }
+      .feat-section { padding: 5rem 1.5rem 3rem; }
+      .showcase { padding: 3rem 1.5rem; }
+      .show-row { gap: 3rem; margin-bottom: 5rem; }
+      .feat-grid { grid-template-columns: 1fr 1fr; }
+      .hero-badge { position: static; margin-top: 1rem; display: inline-flex; }
+    }
+
+    @media (max-width: 600px) {
+      .feat-grid { grid-template-columns: 1fr; }
+      .stats-inner { grid-template-columns: 1fr 1fr; }
+      .nav-links { gap: 1rem; }
+      .hero-h1 { font-size: 3rem; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ─── NAV ─── -->
+<nav>
+  <a href="#" class="nav-logo">Launch<b>Control</b></a>
+  <ul class="nav-links">
+    <li><a href="#features">Features</a></li>
+    <li><a href="#showcase">Walkthrough</a></li>
+    <li><a href="https://github.com" target="_blank">GitHub</a></li>
+    <li>
+      <a href="https://github.com/Isaac12x/launchd-control/releases/latest" class="nav-dl" target="_blank">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7,10 12,15 17,10"/>
+          <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        Download
+      </a>
+    </li>
+  </ul>
+</nav>
+
+<!-- ─── HERO ─── -->
+<section>
+  <div class="hero">
+    <div class="hero-text">
+      <div class="hero-eyebrow au au1">macOS Service Manager</div>
+      <h1 class="hero-h1 au au2">
+        launchd,<br>
+        <em>untangled.</em>
+      </h1>
+      <p class="hero-sub au au3">
+        LaunchControl gives macOS's most capable background task system
+        the interface it never had. See every service on your machine,
+        control it with a click, and stop writing <code>launchctl</code> commands by hand.
+      </p>
+      <div class="hero-actions au au4">
+        <a href="https://github.com/Isaac12x/launchd-control/releases/latest" class="btn-primary" target="_blank">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7,10 12,15 17,10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          Download free for macOS
+        </a>
+        <a href="#showcase" class="btn-ghost">See how it works →</a>
+      </div>
+      <p class="hero-meta au au5">Free · macOS 13+ · v1.0.4</p>
+    </div>
+    <div class="hero-visual au au3">
+      <img src="screenshots/stats.png" alt="LaunchControl — service tree with per-service resource stats" class="hero-img">
+      <div class="hero-badge">
+        <span class="dot dot-green"></span>
+        <span>5 running &nbsp;·&nbsp;</span>
+        <span class="dot dot-amber"></span>
+        <span>2 loaded &nbsp;·&nbsp;</span>
+        <span class="dot dot-gray"></span>
+        <span>4 stopped</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── PROBLEM ─── -->
+<section class="problem">
+  <div class="problem-inner">
+    <div class="reveal">
+      <h2 class="problem-h2">
+        launchd is <em>incredibly</em> powerful.<br>
+        Working with it shouldn't require a degree.
+      </h2>
+      <p class="problem-p" style="margin-top: 1.25rem;">
+        Start, stop, schedule, restart on crash — launchd can do all of it.
+        But the only interface Apple ships is <code style="background: rgba(255,255,255,0.08); color: #d4a017;">launchctl</code>:
+        cryptic terminal commands and hand-edited XML plists.
+        LaunchControl fixes that completely.
+      </p>
+    </div>
+    <div class="code-block reveal">
+      <div><span class="c-dim"># The old way — to change a single option:</span></div>
+      <div style="margin-top: 0.4rem;">
+        <span class="c-cmd">launchctl</span> unload
+        <span class="c-path">~/Library/LaunchAgents/com.acme.worker.plist</span>
+      </div>
+      <div style="margin-top: 0.4rem;">
+        <span class="c-cmd">nano</span>
+        <span class="c-path">~/Library/LaunchAgents/com.acme.worker.plist</span>
+      </div>
+      <div style="margin-top: 0.2rem; padding-left: 1.2rem; opacity: 0.5;">
+        &lt;key&gt;KeepAlive&lt;/key&gt;<br>
+        &lt;true/&gt;
+      </div>
+      <div style="margin-top: 0.4rem;">
+        <span class="c-cmd">launchctl</span> load
+        <span class="c-path">~/Library/LaunchAgents/com.acme.worker.plist</span>
+      </div>
+      <div style="margin-top: 0.4rem;">
+        <span class="c-cmd">launchctl</span> start
+        <span class="c-path">com.acme.worker</span>
+      </div>
+      <div style="margin-top: 0.6rem; opacity: 0.35;">
+        # Did it work? Who knows.
+      </div>
+      <div>
+        <span class="c-cmd">launchctl</span> <span class="c-flag">list</span> | grep
+        <span class="c-str">com.acme</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── FEATURE CARDS ─── -->
+<section class="feat-section" id="features">
+  <div class="feat-intro">
+    <div class="section-label reveal">Everything included</div>
+    <h2 class="section-h2 reveal">The full interface<br>launchd never had.</h2>
+    <p class="section-p reveal">
+      One window for every background service on your Mac — from Homebrew daemons
+      to your own automation scripts — with all the controls you actually need.
+    </p>
+  </div>
+
+  <div class="feat-grid">
+    <div class="feat-card reveal reveal-delay-1">
+      <div class="feat-icon">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+          <line x1="8" y1="6" x2="21" y2="6"/>
+          <line x1="8" y1="12" x2="21" y2="12"/>
+          <line x1="8" y1="18" x2="21" y2="18"/>
+          <line x1="3" y1="6" x2="3.01" y2="6"/>
+          <line x1="3" y1="12" x2="3.01" y2="12"/>
+          <line x1="3" y1="18" x2="3.01" y2="18"/>
+        </svg>
+      </div>
+      <h3>Service tree</h3>
+      <p>All LaunchAgents and Daemons in a navigable folder tree with live RUNNING · STOPPED · LOADED badges per service.</p>
+    </div>
+    <div class="feat-card reveal reveal-delay-2">
+      <div class="feat-icon">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+        </svg>
+      </div>
+      <h3>Live resource stats</h3>
+      <p>CPU, GPU, RAM, VRAM, memory, and energy impact — reported per service in real time. Spot runaway processes instantly.</p>
+    </div>
+    <div class="feat-card reveal reveal-delay-3">
+      <div class="feat-icon">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+          <path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/>
+        </svg>
+      </div>
+      <h3>Automation rules</h3>
+      <p>Keep services alive, start them on app open, and get macOS notifications when a critical service unexpectedly stops.</p>
+    </div>
+    <div class="feat-card reveal reveal-delay-4">
+      <div class="feat-icon">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+          <polyline points="16 18 22 12 16 6"/>
+          <polyline points="8 6 2 12 8 18"/>
+        </svg>
+      </div>
+      <h3>Plist editor</h3>
+      <p>Full XML editing with syntax highlighting and a snippet library. Insert Label, ProgramArguments, KeepAlive with one click.</p>
+    </div>
+  </div>
+  <div class="feat-grid" style="margin-top: 1px; border-top: none; border-radius: 0 0 8px 8px;">
+    <div class="feat-card reveal">
+      <div class="feat-icon">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+          <circle cx="11" cy="11" r="8"/>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+      </div>
+      <h3>Powerful search</h3>
+      <p>Filter by name, label, plist path, or running state across all folders. Find anything instantly.</p>
+    </div>
+    <div class="feat-card reveal reveal-delay-1">
+      <div class="feat-icon">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+          <line x1="12" y1="5" x2="12" y2="19"/>
+          <line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+      </div>
+      <h3>Create services</h3>
+      <p>Write new plists from scratch or let LaunchControl scan your repo and generate a configuration automatically.</p>
+    </div>
+    <div class="feat-card reveal reveal-delay-2">
+      <div class="feat-icon">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+          <line x1="16" y1="13" x2="8" y2="13"/>
+          <line x1="16" y1="17" x2="8" y2="17"/>
+        </svg>
+      </div>
+      <h3>Live log tailing</h3>
+      <p>Stream stdout and stderr from any service in real time. Jump to output files without hunting for paths.</p>
+    </div>
+    <div class="feat-card reveal reveal-delay-3">
+      <div class="feat-icon">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+          <path d="M22 17H2a3 3 0 0 0 3-3V9a7 7 0 0 1 14 0v5a3 3 0 0 0 3 3zm-8.27 4a2 2 0 0 1-3.46 0"/>
+        </svg>
+      </div>
+      <h3>Critical alerts</h3>
+      <p>Mark a service as critical and receive a native macOS notification the moment it goes down after being observed running.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ─── SHOWCASE ─── -->
+<section class="showcase" id="showcase">
+
+  <!-- Tree + Stats -->
+  <div class="show-row reveal">
+    <div class="show-text">
+      <div class="section-label">Service management</div>
+      <h2 class="show-h2">Every service,<br><em>at a glance.</em></h2>
+      <p class="show-p">
+        Navigate all your background services in a tree grouped by folder.
+        Live status badges update as services start, stop, or crash.
+        Click any service to open its full detail panel — no guessing
+        what's running on your machine.
+      </p>
+      <p class="show-p">
+        Start, stop, restart — all from one window.
+        No plist paths, no terminal, no manual.
+      </p>
+      <ul class="detail-list">
+        <li>Live RUNNING · STOPPED · COMPLETED · LOADED status per service</li>
+        <li>Grouped by folder — separate personal and system agents cleanly</li>
+        <li>PID, enable state, and plist path always visible in the detail view</li>
+        <li>In-progress feedback during start, stop, and restart actions</li>
+      </ul>
+    </div>
+    <div class="show-visual">
+      <img src="screenshots/stats.png" alt="Service tree with live stats" class="show-img">
+    </div>
+  </div>
+
+  <!-- Automation -->
+  <div class="show-row flip reveal">
+    <div class="show-text">
+      <div class="section-label">Automation</div>
+      <h2 class="show-h2">Rules that keep<br><em>everything running.</em></h2>
+      <p class="show-p">
+        Describe what should happen and LaunchControl handles it.
+        No cron jobs, no shell scripts, no babysitting your services
+        after a reboot or a crash.
+      </p>
+      <ul class="detail-list">
+        <li>Start service when LaunchControl opens (with configurable delay)</li>
+        <li>Keep service alive — restart it whenever it stops unexpectedly</li>
+        <li>Critical service flag — get notified immediately when it goes down</li>
+        <li>Add LaunchControl to Login Items for always-on enforcement</li>
+      </ul>
+    </div>
+    <div class="show-visual">
+      <img src="screenshots/automation.png" alt="Automation rules panel" class="show-img">
+    </div>
+  </div>
+
+  <!-- Plist editor -->
+  <div class="show-row reveal">
+    <div class="show-text">
+      <div class="section-label">Plist editor</div>
+      <h2 class="show-h2">Edit plists like<br><em>a human.</em></h2>
+      <p class="show-p">
+        Full XML editing with syntax highlighting — plus a library of
+        ready-to-insert snippets on the side. No more memorizing launchd
+        XML keys or hunting through Apple documentation.
+      </p>
+      <ul class="detail-list">
+        <li>Syntax-highlighted editor with full plist XML access</li>
+        <li>Insert library for Label, ProgramArguments, KeepAlive, and more</li>
+        <li>Validates XML before writing to disk — safe by default</li>
+        <li>Save, revert, or cancel with dedicated controls</li>
+      </ul>
+    </div>
+    <div class="show-visual">
+      <img src="screenshots/plist-editor.png" alt="Plist editor with insert library" class="show-img">
+    </div>
+  </div>
+
+  <!-- Create service -->
+  <div class="show-row flip reveal">
+    <div class="show-text">
+      <div class="section-label">New services</div>
+      <h2 class="show-h2">Create a service<br><em>in seconds.</em></h2>
+      <p class="show-p">
+        Write a new launch agent from scratch with a validated plist form,
+        or use the Repository tab to let LaunchControl detect your project
+        type, find your run command, and generate the plist automatically.
+      </p>
+      <ul class="detail-list">
+        <li>Raw plist mode with snippet library on the side</li>
+        <li>Repository-assisted mode: auto-detect run commands</li>
+        <li>Destination path stays aligned with the service label</li>
+        <li>Validates and writes directly to your LaunchAgents folder</li>
+      </ul>
+    </div>
+    <div class="show-visual">
+      <img src="screenshots/create-service.png" alt="Create new service form" class="show-img">
+    </div>
+  </div>
+
+</section>
+
+<!-- ─── STATS BAND ─── -->
+<section class="stats-band">
+  <div class="stats-inner">
+    <div class="reveal">
+      <div class="stat-val">0</div>
+      <div class="stat-label">Terminal commands needed</div>
+    </div>
+    <div class="reveal reveal-delay-1">
+      <div class="stat-val">6</div>
+      <div class="stat-label">Resource metrics, per service</div>
+    </div>
+    <div class="reveal reveal-delay-2">
+      <div class="stat-val">1<sup>s</sup></div>
+      <div class="stat-label">Live stats refresh interval</div>
+    </div>
+    <div class="reveal reveal-delay-3">
+      <div class="stat-val">∞</div>
+      <div class="stat-label">Services you can manage</div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── CTA ─── -->
+<section class="cta-section" id="download">
+  <div class="section-label reveal" style="display: block; text-align: center; margin-bottom: 0.75rem;">Free download</div>
+  <h2 class="cta-h2 reveal">
+    Stop fighting launchd.<br>
+    <em>Start using it.</em>
+  </h2>
+  <p class="cta-p reveal">
+    LaunchControl is a native macOS app for every developer, sysadmin, or
+    power user who runs background services and deserves better than a terminal
+    and a stack of XML files.
+  </p>
+  <div class="cta-actions reveal">
+    <a href="https://github.com/Isaac12x/launchd-control/releases/latest" class="btn-primary" style="padding: 1rem 2.5rem; font-size: 0.95rem;" target="_blank">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="7,10 12,15 17,10"/>
+        <line x1="12" y1="15" x2="12" y2="3"/>
+      </svg>
+      Download v1.0.4
+    </a>
+    <a href="https://github.com" class="btn-ghost" style="font-size: 0.9rem;">
+      View source on GitHub →
+    </a>
+  </div>
+  <p class="cta-note reveal">Free · macOS 13 Ventura or later · Native app · Open source</p>
+</section>
+
+<!-- ─── FOOTER ─── -->
+<div class="footer-wrap">
+  <div class="footer-logo">Launch<b>Control</b></div>
+  <ul class="footer-links">
+    <li><a href="https://github.com">GitHub</a></li>
+    <li><a href="#">Changelog</a></li>
+    <li><a href="#">License</a></li>
+  </ul>
+  <div class="footer-copy">v1.0.4 · macOS</div>
+</div>
+
+<script>
+  // Scroll reveal
+  const els = document.querySelectorAll('.reveal');
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        e.target.classList.add('in');
+        io.unobserve(e.target);
+      }
+    });
+  }, { threshold: 0.1 });
+  els.forEach(el => io.observe(el));
+
+  // Stagger sibling reveals inside grids
+  document.querySelectorAll('.feat-grid').forEach(grid => {
+    grid.querySelectorAll('.reveal').forEach((card, i) => {
+      card.style.transitionDelay = (i * 0.06) + 's';
+    });
+  });
+
+  document.querySelectorAll('.stats-inner').forEach(strip => {
+    strip.querySelectorAll('.reveal').forEach((item, i) => {
+      item.style.transitionDelay = (i * 0.08) + 's';
+    });
+  });
+</script>
+</body>
+</html>
